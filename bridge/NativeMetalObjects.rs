@@ -19,7 +19,7 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
-    MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+    Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use std::cell::RefCell;
@@ -161,12 +161,14 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
         let mut options = DeviceOptions::default();
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
-        options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
         // A texture over a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window server's padded
         // framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a shadow image every pass.
-        options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::AliasWrites;
+        options.policy.padded_rows = metal2vulkan::device::PaddedRowsPolicy::AliasWrites;
+        // This frontend never rebinds a no-copy buffer's pages (NativeMetalObjects.h), so the encoders log no calls for a rebind
+        // (bridge patch 0013's option; the old pin had the option but nothing set it).
+        options.refuse_rebinds = true;
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
@@ -279,7 +281,8 @@ pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut 
         // SAFETY: the header's eight words.
         let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
         let w = get(device)?.0.work_counts();
-        out.copy_from_slice(&[w.pitched_host_images, w.pitched_host_image_refusals, w.pitched_host_image_refusals_recalled,
+        // The runtime no longer counts pitched host image refusals (metal2vulkan development): those two words stay 0.
+        out.copy_from_slice(&[w.pitched_host_images, 0, 0,
                               w.shadowed_textures, w.shadow_copies, w.shadow_texels_copied_back, w.linear_passes_in_place,
                               w.linear_passes_through_copies]);
         Ok(true)
@@ -1650,7 +1653,7 @@ fn shared<'a>(event: *const NmbEvent) -> Result<&'a SharedEvent, String> {
 /// forwards to it).
 fn listener() -> Result<&'static SharedEventListener, String> {
     static LISTENER: std::sync::OnceLock<Result<SharedEventListener, String>> = std::sync::OnceLock::new();
-    LISTENER.get_or_init(|| SharedEventListener::new().map_err(e("listener"))).as_ref().map_err(|why| why.clone())
+    LISTENER.get_or_init(|| Ok(SharedEventListener::new())).as_ref().map_err(|why| why.clone())
 }
 
 #[unsafe(no_mangle)]

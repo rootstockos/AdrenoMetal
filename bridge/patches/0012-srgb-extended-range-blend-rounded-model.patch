@@ -1,0 +1,145 @@
+diff --git a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
+index 33c67576..b9fac6a0 100644
+--- a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
++++ b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
+@@ -102,9 +102,11 @@
+ //! output's model, in any of the four factors); the color channels' `BlendColor` with
+ //! `OneMinusBlendColor` under `Subtract` or `ReverseSubtract` (Metal's result there follows
+ //! neither form for every blend color the sweeps drew); a write mask of exactly one color channel
+-//! (Metal blends that channel otherwise than the vector form); a `BGRA10_XR_sRGB` blend beyond the
+-//! narrow ones (`SrgbForm`), and a `float4` output into it beyond them (`FloatOutput`), both
+-//! measured only; and any other output.
++//! (Metal blends that channel otherwise than the vector form); a `float4` output into
++//! `BGRA10_XR_sRGB` beyond the narrow blends where the fast models hold it (`FloatOutput`); and any
++//! other output. A `BGRA10_XR_sRGB` blend beyond the narrow ones, or masked, takes the rounded
++//! model (Metal's without fast math, apart from the fast-math result only in roundings) rather than
++//! no pipeline.
+ 
+ use super::blend_color::SRGB_DIRECT_TOP;
+ use super::{floats, per_lane_f, source_range, SRGB_SOURCE_RANGE};
+@@ -989,11 +991,16 @@ fn planned_for(
+     let narrow = narrow(eq);
+     // The rounded model holds for any blend into an `_sRGB` form, a mask of one color channel,
+     // and the color channels' blend color difference; the fast models for `BGRA10_XR_sRGB`'s
+-    // narrow blends alone.
++    // narrow blends alone. A `BGRA10_XR_sRGB` blend the fast models do not hold (any but a
++    // narrow, unmasked one) takes the rounded model, Metal's own without fast math, which the
++    // lane table measures for every `_sRGB` form and which differs from the fast-math result
++    // only in roundings, rather than no pipeline: NanoUniverse's starfield (the Astronomy
++    // wallpaper, `BGRA10_XR_sRGB`) had none.
++    let math = match math {
++        BlendMath::Fast if narrow_only && (!narrow || masked) => BlendMath::Rounded,
++        math => math,
++    };
+     let fast = math == BlendMath::Fast;
+-    if fast && narrow_only && (!narrow || masked) {
+-        return Err(refused(ExtendedRangeBlend::SrgbForm));
+-    }
+     let opaque_ = !has_alpha;
+     let color = match colors {
+         0 => None,
+@@ -1518,6 +1525,14 @@ impl Blend {
+     /// Metal's model's: a `half4` one; a `float4` one under a blend whose color lanes take one term
+     /// alone, unmasked, rounded to `half` first; another is the gap it is.
+     pub fn takes(&self, output: Option<FloatFmt>) -> Result<(), Error> {
++        // The rounded model (a `BGRA10_XR_sRGB` blend beyond the fast models, [`planned_for`])
++        // rounds a `float4` output to `half` first, as a `half4` one.
++        if self.math == BlendMath::Rounded {
++            return match output {
++                Some(FloatFmt::Half | FloatFmt::F32) => Ok(()),
++                _ => Err(refused(ExtendedRangeBlend::Output)),
++            };
++        }
+         match output {
+             Some(FloatFmt::Half) => Ok(()),
+             Some(FloatFmt::F32) if self.narrow && self.takes_float && !self.masked => Ok(()),
+diff --git a/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs b/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs
+index 81d2748e..a913cb5a 100644
+--- a/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs
++++ b/crates/metal2vulkan/src/lower/arith/extended_range/tests.rs
+@@ -1385,17 +1385,20 @@ fn blends_outside_the_model_are_refused_by_name() {
+     };
+     let bgra = ExtendedRange::Bgra10 { srgb: true };
+     let bgr = ExtendedRange::Bgr10 { srgb: true };
+-    assert_eq!(gap(&over, bgra, ALL), Some(ExtendedRangeBlend::SrgbForm));
++    // Into `BGRA10_XR_sRGB` beyond the narrow blends: the rounded model, not a refusal.
++    assert_eq!(gap(&over, bgra, ALL), None);
++    assert!(Blend::of(&over, bgra, ALL, BlendMath::Fast).is_ok_and(|b| b.math == BlendMath::Rounded));
+     assert_eq!(gap(&over, srgb, ALL), None);
+     assert_eq!(gap(&over, bgr, ALL), None);
+     let rgb = ColorWriteMask::ALL.difference(ColorWriteMask::ALPHA);
+-    assert_eq!(gap(&premul, bgra, rgb), Some(ExtendedRangeBlend::SrgbForm));
++    assert_eq!(gap(&premul, bgra, rgb), None);
+     assert_eq!(gap(&premul, srgb, rgb), None);
+     // A `float4` output into them takes its own model, as a linear form's.
+     let float = |form| Blend::for_output(&over, form, ALL, (Some(FloatFmt::F32), BlendMath::Fast));
+     assert!(float(srgb).is_ok_and(|b| b.float));
+     assert!(float(bgr).is_ok_and(|b| b.float));
+-    assert!(float(bgra).is_err());
++    // Into `BGRA10_XR_sRGB` the rounded model, rounded to `half` first.
++    assert!(float(bgra).is_ok_and(|b| b.math == BlendMath::Rounded && !b.float));
+     // A `float4` output: the blends whose color lanes take one term alone, unmasked.
+     let takes = |eq: &BlendEquation, mask: ColorWriteMask, fmt: Option<FloatFmt>| match Blend::of(
+         eq,
+@@ -2252,8 +2255,16 @@ fn blend_table_is_metals(
+             FloatFmt::F32
+         };
+         let (ours, written) = table_outcome(pf, &eq, mask, (output, math));
+-        // A computed `float4`'s blend Metal rounds otherwise than a loaded one's is announced.
+         let form = ExtendedRange::of(pf).expect("an extended-range format");
++        // A `BGRA10_XR_sRGB` fast-math blend beyond the fast models takes the rounded model
++        // (`planned_for`) where the table, Metal's fast-math bytes, has no model: made, a
++        // near-equivalent whose bytes are not those, so they are not compared.
++        let rounded = math == BlendMath::Fast
++            && written.is_some_and(|w| {
++                Blend::for_output(&eq, form, w, (Some(output), math))
++                    .is_ok_and(|b| b.math == BlendMath::Rounded)
++            });
++        // A computed `float4`'s blend Metal rounds otherwise than a loaded one's is announced.
+         let (ours, written) = match written {
+             Some(_) if computed && !super::computed::holds_as_loaded(&eq, form) => {
+                 ("announced".to_owned(), None)
+@@ -2266,6 +2277,12 @@ fn blend_table_is_metals(
+             if row.half { "h" } else { "f" },
+             row.config
+         );
++        if rounded {
++            if row.ours != "SrgbForm" && row.ours != "FloatOutput" {
++                wrong.push(format!("{what}: rounded model, the table {}", row.ours));
++            }
++            continue;
++        }
+         if ours != row.ours {
+             wrong.push(format!("{what}: ours {ours}, the table {}", row.ours));
+         }
+diff --git a/crates/metal2vulkan/src/tests/engine_fragment.rs b/crates/metal2vulkan/src/tests/engine_fragment.rs
+index 42d06178..77f44523 100644
+--- a/crates/metal2vulkan/src/tests/engine_fragment.rs
++++ b/crates/metal2vulkan/src/tests/engine_fragment.rs
+@@ -2106,7 +2106,7 @@ fn a_replacing_blend_or_a_write_that_stores_nothing_takes_the_storage_form() {
+ /// pipeline): on every committed profile that orders fetch through the interlock, the shader
+ /// blends color 0, a `half4` output's and a `float4` one's, and the module passes L3. Into
+ /// `BGRA10_XR_sRGB`, whose fast blends beyond the narrow ones Metal computes otherwise, the same
+-/// blend stays refused by name (`ExtendedRangeBlend::SrgbForm`).
++/// blend takes the rounded model (Metal's without fast math) and is made too.
+ #[test]
+ fn a_fast_source_alpha_over_blend_into_an_srgb_extended_range_attachment_is_made() {
+     use crate::metal::BlendFactor;
+@@ -2161,12 +2161,11 @@ fn a_fast_source_alpha_over_blend_into_an_srgb_extended_range_attachment_is_made
+         let inputs = state(&colors(PixelFormat::BGRA10XRSRGB), &p);
+         match compile_with(&fills, "rt6_fill_rgba16float", &p, &inputs) {
+             Err(Error::Unsupported(u)) if u.needs != Needs::NotImplemented => {}
+-            Err(Error::Unsupported(u)) => assert_eq!(
+-                u.feature,
+-                Feature::ExtendedRangeBlend(crate::error::ExtendedRangeBlend::SrgbForm),
+-                "{stem}"
+-            ),
+-            other => panic!("{stem}: BGRA10_XR_sRGB: {:?}", other.map(|_| ())),
++            Ok(a) => {
++                link_and_validate(&a, &p)
++                    .unwrap_or_else(|e| panic!("{stem}: BGRA10_XR_sRGB: L3: {e}"));
++            }
++            Err(e) => panic!("{stem}: BGRA10_XR_sRGB: {e}"),
+         }
+     }
+     assert!(

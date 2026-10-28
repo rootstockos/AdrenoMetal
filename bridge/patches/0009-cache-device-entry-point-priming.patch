@@ -1,50 +1,76 @@
 diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
-index 990c892..00a6e55 100644
+index 6fd83123..9857d587 100644
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
-@@ -962,6 +962,21 @@ impl Device {
-         // SAFETY: the device is live, of `physical`, and enables timeline semaphores, and
-         // `bufferDeviceAddress` where `device_address` says so; `queues` holds at least one of
-         // its queues, which nothing uses yet.
-+        let priming_has = prime::Has {
+@@ -1429,6 +1429,33 @@ impl Device {
+             color_write_masks,
+             sized_index_bind,
+         };
++        let priming_has = drawn.has(prime::Has {
 +            timestamps: timestamp_bits > 0,
++            // A device the runtime created enables it (`enables.rs`).
++            host_query_reset: owned,
 +            device_addresses: device_address,
 +            generated_commands: generated_commands.is_some(),
 +            sparse_binding: sparse.binds(),
-+        };
-+        // Raw disk/cache I/O only: starting the ordinary guarded cache or its
-+        // worker before priming would change the destructor ordering it protects.
++            push_descriptor: push_descriptor.is_some(),
++            calibration: calibrated.is_some(),
++            object_names: object_name.is_some(),
++            extended_dynamic_state: false,
++            primitive_restart: false,
++            color_write_masks: false,
++            sized_index_bind: false,
++            ycbcr_conversion: ycbcr_formats.primer().is_some(),
++        });
++        // Priming's pipeline cache on disk: the store alone, with no cache thread, made before
++        // the ordinary shader cache starts (below), whose thread and exit-guard sections priming
++        // must precede.
 +        let priming_cache = cache.priming(
++            // SAFETY: `physical` belongs to `instance`.
 +            &unsafe { instance.raw.get_physical_device_properties(physical) },
 +            compile.profile_fingerprint(),
 +            instance.settings,
 +            prime::cache_key(priming_has, queue_family),
 +            instance.sink().cloned(),
 +        );
-         if let Err(error) = unsafe {
-             prime::prime(
-                 &instance.raw,
-@@ -971,13 +986,9 @@ impl Device {
+         // Before the exit hook is registered for this device (below): the first call of each
+         // entry point of the exit guard's table (`prime.rs`).
+         // SAFETY: the device is live, of `physical`, and enables timeline semaphores, and
+@@ -1449,27 +1476,13 @@ impl Device {
                  queue_family,
                  &queues,
                  Sharing::new(&queue_families),
--                prime::Has {
+-                drawn.has(prime::Has {
 -                    timestamps: timestamp_bits > 0,
+-                    // A device the runtime created enables it (`enables.rs`).
+-                    host_query_reset: owned,
 -                    device_addresses: device_address,
 -                    generated_commands: generated_commands.is_some(),
 -                    sparse_binding: sparse.binds(),
--                },
+-                    push_descriptor: push_descriptor.is_some(),
+-                    calibration: calibrated.is_some(),
+-                    object_names: object_name.is_some(),
+-                    extended_dynamic_state: false,
+-                    primitive_restart: false,
+-                    color_write_masks: false,
+-                    sized_index_bind: false,
+-                    ycbcr_conversion: ycbcr_formats.primer().is_some(),
+-                }),
 +                priming_has,
                  generated_commands.as_ref(),
+                 push_descriptor,
+                 calibrated,
+                 drawn,
+                 ycbcr_formats.primer(),
 +                priming_cache,
              )
          } {
              scheduler.stop();
 diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
-index 91791ba..50856aa 100644
+index e953806b..e161d9fc 100644
 --- a/crates/metal2vulkan-runtime/src/device/prime.rs
 +++ b/crates/metal2vulkan-runtime/src/device/prime.rs
-@@ -52,9 +52,11 @@ use crate::generated_commands::{
+@@ -82,9 +82,11 @@ use crate::gpu_time::Calibration;
  use crate::loader_word::LoaderWord;
  use crate::memory;
  use crate::release::{self, Generated, Released};
@@ -55,23 +81,24 @@ index 91791ba..50856aa 100644
 +use sha2::{Digest, Sha256};
  use std::time::{Duration, Instant};
  
- use super::QueueSlot;
-@@ -184,7 +186,7 @@ const VERTEX_SHADER: [u32; 29] = [
- 
- /// What the device primed has: a queue family that writes timestamps, device addresses,
- /// `VK_EXT_device_generated_commands`, and sparse binding on its queues.
+ use super::functions::Vk;
+@@ -361,7 +363,7 @@ fn specialization() -> vk::SpecializationInfo<'static> {
+ /// What the device primed has: a queue family that writes timestamps, `hostQueryReset`, device
+ /// addresses, `VK_EXT_device_generated_commands`, sparse binding on its queues, the push command,
+ /// calibrated timestamps, and the render encoder's commands of [`PrimedDraws`].
 -#[derive(Clone, Copy)]
 +#[derive(Clone, Copy, Debug)]
  pub(crate) struct Has {
      pub(crate) timestamps: bool,
-     pub(crate) device_addresses: bool,
-@@ -192,6 +194,16 @@ pub(crate) struct Has {
-     pub(crate) sparse_binding: bool,
+     pub(crate) host_query_reset: bool,
+@@ -403,6 +405,17 @@ impl PrimedDraws {
+     }
  }
  
-+/// Identity includes every byte of the helper implementation, enabled compile
-+/// profile (in Records), instance settings, driver identity, and these choices.
-+/// No pointer/handle or host path enters the persistent key.
++/// The key of priming's pipeline cache record ([`PrimingCache`]): every byte of this file (its
++/// shaders and the pipelines it makes of them), what the device has and the queue family. The
++/// record's name adds the driver's identity, the instance's settings and the profile
++/// (`shader_cache::Records`). No handle or host path enters it.
 +pub(super) fn cache_key(has: Has, queue_family: u32) -> metal2vulkan::cache::Hash256 {
 +    crate::shader_cache::driver::Making::new("entry-point-priming-v1")
 +        .digest(&Sha256::digest(include_bytes!("prime.rs")).into())
@@ -81,16 +108,16 @@ index 91791ba..50856aa 100644
 +
  /// Prime `device` of `physical`, made from `instance`, whose queues are `queues`, the first of
  /// its primary family `queue_family`, its buffers and images shared as `sharing` says, on this
- /// thread; `has` says what the device has, and `generated` holds the commands of
-@@ -213,6 +225,7 @@ pub(super) unsafe fn prime(
-     sharing: Sharing<'_>,
-     has: Has,
-     generated: Option<&Commands>,
+ /// thread; `has` says what the device has, `generated` holds the commands of
+@@ -430,6 +443,7 @@ pub(super) unsafe fn prime(
+     calibration: Option<Calibration>,
+     drawn: PrimedDraws,
+     ycbcr: Option<vk::SamplerYcbcrConversionCreateInfo<'static>>,
 +    mut disk: PrimingCache,
  ) -> Result<(), Error> {
      let mut primer = Primer {
          device,
-@@ -222,6 +235,8 @@ pub(super) unsafe fn prime(
+@@ -442,6 +456,8 @@ pub(super) unsafe fn prime(
          memory: unsafe { instance.get_physical_device_memory_properties(physical) },
          calls: 0,
          held: Vec::new(),
@@ -99,10 +126,12 @@ index 91791ba..50856aa 100644
      };
      // SAFETY: the caller's.
      let primed = unsafe {
-@@ -239,6 +254,10 @@ pub(super) unsafe fn prime(
+@@ -460,6 +476,12 @@ pub(super) unsafe fn prime(
      unsafe {
          let _ = device.device_wait_idle();
          primer.made(Call::DeviceWaitIdle);
++        // The pipeline cache's data, kept on disk for the next process's priming, before the
++        // cache is released below.
 +        if primed.is_ok() && primer.pipeline_cache != vk::PipelineCache::null() {
 +            primer.disk.keep(device, loader_word, primer.pipeline_cache);
 +            primer.made(Call::GetPipelineCacheData);
@@ -110,16 +139,18 @@ index 91791ba..50856aa 100644
          while let Some(release) = primer.held.pop() {
              let call = release(device);
              primer.made(call);
-@@ -303,6 +322,8 @@ struct Primer<'a> {
+@@ -547,6 +569,10 @@ struct Primer<'a> {
      calls: u128,
      /// What was made, released last first.
      held: Vec<Release>,
++    /// Where the pipeline cache's data is kept between processes.
 +    disk: &'a mut PrimingCache,
++    /// The pipeline cache priming's pipelines are made with, seeded from `disk`, once made.
 +    pipeline_cache: vk::PipelineCache,
  }
  
  impl Primer<'_> {
-@@ -575,7 +596,7 @@ impl Primer<'_> {
+@@ -840,7 +866,7 @@ impl Primer<'_> {
                  .layout(layout)
                  .push_next(&mut flags);
              let pipeline = device
@@ -128,7 +159,7 @@ index 91791ba..50856aa 100644
                  .map_err(|(_, error)| vulkan(error))?[0];
              self.hold(pipeline);
              let pipelines = ExecutionSetPipelineInfo::new(pipeline, 1);
-@@ -848,9 +869,8 @@ impl Primer<'_> {
+@@ -1171,9 +1197,8 @@ impl Primer<'_> {
              let module = device.create_shader_module(&info, None).map_err(vulkan)?;
              self.made(Call::CreateShaderModule);
              self.hold(module);
@@ -139,12 +170,12 @@ index 91791ba..50856aa 100644
 +            self.pipeline_cache = cache;
              self.made(Call::CreatePipelineCache);
              self.hold(cache);
-             let stage = vk::PipelineShaderStageCreateInfo::default()
+             let specialization = specialization();
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
-index 88e0fad..513fe37 100644
+index e6cda03d..22542fd3 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
-@@ -282,6 +282,106 @@ impl CacheSetup {
+@@ -366,6 +366,107 @@ impl CacheSetup {
      }
  }
  
@@ -168,14 +199,15 @@ index 88e0fad..513fe37 100644
 +        sink: Option<MessageSink>,
 +    ) -> PrimingCache {
 +        let identity = driver::Identity::of(properties);
-+        let name = Records {
++        let records = Records {
 +            identity,
 +            settings,
 +            profile,
-+        }
-+        .name(Making::new("device-entry-point-priming").digest(&key));
++        };
++        let name = records.name(&records.key(Making::new("device-entry-point-priming").digest(&key)));
 +        PrimingCache {
-+            store: Store::new(self.directory.clone(), sink),
++            // No cache thread: its writes are made on the priming thread (`Store::new`).
++            store: Store::new(self.directory.clone(), sink, None),
 +            identity,
 +            name,
 +            loaded: None,
@@ -240,7 +272,7 @@ index 88e0fad..513fe37 100644
 +        }
 +        if self
 +            .store
-+            .write_record(&self.name, &driver::seal(&self.identity, &data))
++            .write_record_soon(&self.name, driver::seal(&self.identity, &data))
 +            .is_err()
 +        {
 +            self.store.write_failed();
@@ -249,5 +281,5 @@ index 88e0fad..513fe37 100644
 +}
 +
  /// One device's shader cache: its memo, its view of the directory, what names its makings'
- /// records, and the cache thread.
+ /// records, the `VkPipelineCache` it keeps for each record, and the cache thread.
  pub(super) struct ShaderCache {
