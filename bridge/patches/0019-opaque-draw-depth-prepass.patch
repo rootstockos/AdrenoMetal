@@ -113,7 +113,7 @@ index 35ddfb92..121f84a1 100644
  /// its image, recorded before the pass: each of the pass's instances loads it.
  pub(super) struct HiddenClear {
 diff --git a/crates/metal2vulkan-runtime/src/pipeline/predicted.rs b/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
-index f15d951a..88de47bc 100644
+index f15d951a..df69a36a 100644
 --- a/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
 +++ b/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
 @@ -45,6 +45,8 @@
@@ -195,7 +195,7 @@ index f15d951a..88de47bc 100644
          let pipeline = variant.pipeline();
          let graphics = &pipeline.graphics;
          if graphics.writes_depth {
-@@ -198,6 +224,20 @@ impl GraphicsState {
+@@ -198,6 +224,19 @@ impl GraphicsState {
          };
          let fetch_inputs =
              colors.iter().any(Option::is_some) && framebuffer_fetch::through_inputs(profile);
@@ -204,8 +204,7 @@ index f15d951a..88de47bc 100644
 +        // depth test the prepass's draws take where they may be hidden.
 +        let prepass = depth_stencil.is_none()
 +            && colors.iter().any(Option::is_some)
-+            && descriptor.raster_sample_count == 1
-+            && !fetch_inputs;
++            && descriptor.raster_sample_count == 1;
 +        let depth_stencil = match prepass {
 +            true => Some(attachment(
 +                crate::attachment_stand_in::PREPASS_DEPTH_FORMAT,
@@ -216,7 +215,7 @@ index f15d951a..88de47bc 100644
          let mut storage = Vec::new();
          if !fetch_inputs {
              for s in &graphics.storage_attachments {
-@@ -271,6 +311,11 @@ impl GraphicsState {
+@@ -271,6 +310,11 @@ impl GraphicsState {
                  profile,
              )
              .ok()?;
@@ -228,7 +227,7 @@ index f15d951a..88de47bc 100644
          // A shader-side stencil's draws test the stencil in the function (`draw_fixed`).
          if graphics.shadow_stencil.is_some() {
              fixed.depth_stencil.stencil_test_enable = false;
-@@ -289,7 +334,7 @@ impl GraphicsState {
+@@ -289,7 +333,7 @@ impl GraphicsState {
              fixed: FixedState::without_dynamic(fixed, &graphics.dynamic_states),
              sample_positions: Vec::new(),
          };
@@ -566,10 +565,10 @@ index 6eb8b140..88de1579 100644
              drawn_before: snapshot.drawn.clone(),
 diff --git a/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
 new file mode 100644
-index 00000000..f2d7e4a1
+index 00000000..2d302103
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,208 @@
 +//! The depth prepass of a pass's opaque draws: hidden-surface removal for a pass without a depth
 +//! attachment.
 +//!
@@ -594,8 +593,10 @@ index 00000000..f2d7e4a1
 +//!   fragment unshaded. A draw that may not be hidden ([`Role::Untested`]) draws with the depth
 +//!   test off, as before.
 +//! - **Which passes.** A pass of colors only, one sample, one layer, no visibility buffer, custom
-+//!   sample positions, rasterization-rate map, framebuffer fetch, tile memory, color groups or
-+//!   extended-range shadows that keep its draws ([`admits`]). Its first instance records in a
++//!   sample positions, rasterization-rate map, tile memory, color groups or extended-range
++//!   shadows that keep its draws ([`admits`]). A pass whose draws may fetch its colors through input
++//!   attachments renders it too: a fetching draw is never hidden and hides nothing
++//!   ([`Role::Untested`]), and a fragment it reads is one no later opaque draw covered. Its first instance records in a
 +//!   secondary command buffer, as any pass with a depth attachment (`inline_first.rs`).
 +//! - **Which draws.** One hides what it covers where it is opaque over every color whose texels
 +//!   outlive the pass (no blending, every channel written), its fragment function writes no
@@ -637,7 +638,6 @@ index 00000000..f2d7e4a1
 +        && layout.layers <= 1
 +        && layout.visibility.is_none()
 +        && layout.sample_positions.is_empty()
-+        && !layout.fetch_inputs
 +        && layout.tile.threadgroup_memory_length == 0
 +        && layout.tile.sample_length == 0
 +        && layout.fails_command_buffer.is_none()
