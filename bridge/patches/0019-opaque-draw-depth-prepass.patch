@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-runtime/src/attachment_stand_in.rs b/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
-index 35ddfb92..cd87c084 100644
+index 35ddfb92..121f84a1 100644
 --- a/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
 +++ b/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
 @@ -631,6 +631,109 @@ pub(super) fn hidden(maker: &CommandBuffer, layout: &PassLayout) -> Result<Targe
@@ -8,7 +8,7 @@ index 35ddfb92..cd87c084 100644
  
 +/// The depth of a pass's opaque-draw prepass (`render/opaque_prepass.rs`): a private
 +/// [`PREPASS_DEPTH_FORMAT`] image of the pass's extent, one sample and one layer, as a
-+/// depth/stencil attachment only. Its pass clears it before its draws and stores nothing of it, so no
++/// depth/stencil attachment only. Its pass clears it as it begins and stores nothing of it, so no
 +/// pass reads what another left, and one image serves every such pass of the extent on
 +/// `maker`'s queue, kept in the queue's pool as a memoryless color's backing is
 +/// ([`pooled_backing`]): the passes that take it are ordered by their uses of it, as by any
@@ -284,7 +284,7 @@ index 641a8a58..c62bb218 100644
              }
              pending.push(ticket.pending());
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index 8495e82f..e52c38a7 100644
+index 8495e82f..6f88f7ad 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
 @@ -398,6 +398,7 @@ mod late_resolve;
@@ -366,22 +366,12 @@ index 8495e82f..e52c38a7 100644
              heaps_noted: None,
              inline: match inline {
                  Some(splits) => inline_first::Inline::Open { splits },
-@@ -4023,6 +4044,23 @@ impl RenderLowering {
+@@ -4023,6 +4044,13 @@ impl RenderLowering {
          core.device().shared().live_binds.give(live);
          earlier.push(current);
          let mut instances = earlier;
 +        // Each instance's opaque-draw prepass runs first in its subpass
-+        // (`render/opaque_prepass.rs`), ended with its other secondaries below. The first
-+        // instance's clears the depth, a prepass of no draw too.
-+        let prepass_pass = (layout.depth_stencil.as_ref()).is_some_and(|ds| ds.prepass);
-+        if let Some(first) = instances.first_mut().filter(|_| prepass_pass) {
-+            if first.prepass == vk::CommandBuffer::null() {
-+                let compatible = Arc::clone(&first.compatible);
-+                first.prepass = core.command_buffer().begin_draws(&compatible)?;
-+                let raw = core.device().shared().vk();
-+                opaque_prepass::clear_depth(raw, first.prepass, layout.extent);
-+            }
-+        }
++        // (`render/opaque_prepass.rs`), ended with its other secondaries below.
 +        for instance in &mut instances {
 +            if instance.prepass != vk::CommandBuffer::null() {
 +                instance.pieces.insert(0, Piece::Draws(instance.prepass));
@@ -390,11 +380,11 @@ index 8495e82f..e52c38a7 100644
          // The first instance's render pass and framebuffer, where it recorded inline in the
          // command buffer the encoder holds for the pass (`render/inline_first.rs`), and the
          // instances' after a split that recorded inline there too (`render/inline_splits.rs`):
-@@ -4784,10 +4822,11 @@ impl RenderLowering {
+@@ -4784,10 +4812,11 @@ impl RenderLowering {
          // (`fragment_imageblock.rs`).
          let imageblock_clear = imageblock.as_ref().map(PassImageblock::clear).transpose()?;
          // The hidden depth and stencil's clear to Metal's 1.0 and 0, which every instance loads.
-+        // The prepass's depth clears in its first instance's prepass (`render/opaque_prepass.rs`).
++        // The prepass's depth clears as its first instance begins (`render/opaque_prepass.rs`).
          let hidden_clear = layout
              .depth_stencil
              .as_ref()
@@ -403,7 +393,7 @@ index 8495e82f..e52c38a7 100644
              .map(|ds| HiddenClear::plan(&ds.target))
              .transpose()?;
          // A single-sampled attachment's resolve: its texels, from the image the pass rendered
-@@ -5305,7 +5344,8 @@ impl RenderLowering {
+@@ -5305,7 +5334,8 @@ impl RenderLowering {
                              steps.after(raw, command_buffer, last, tiles);
                          }
                          let later = drawn.iter().zip(&objects);
@@ -413,7 +403,7 @@ index 8495e82f..e52c38a7 100644
                          {
                              // Each instance after the first sees everything the one before wrote.
                              if index > 0 {
-@@ -5313,10 +5353,20 @@ impl RenderLowering {
+@@ -5313,10 +5343,20 @@ impl RenderLowering {
                              }
                              steps.before(raw, command_buffer, index);
                              steps.begin(raw, command_buffer, index, pass.raw, framebuffer.raw);
@@ -438,7 +428,7 @@ index 8495e82f..e52c38a7 100644
                              }
                              raw.cmd_end_render_pass(command_buffer);
                              steps.ended(raw, command_buffer, index);
-@@ -6160,6 +6210,8 @@ impl RenderLowering {
+@@ -6160,6 +6200,8 @@ impl RenderLowering {
              // And in a pass that may hold an extended-range color's shadow, on every device.
              rerecord: self.extended.keeps_draws().then(Vec::new),
              bound: Bound::default(),
@@ -447,7 +437,7 @@ index 8495e82f..e52c38a7 100644
              drawn: clear_reach::DrawnArea::default(),
              inline: false,
              continues: false,
-@@ -6274,6 +6326,8 @@ impl RenderLowering {
+@@ -6274,6 +6316,8 @@ impl RenderLowering {
              positioned: None,
              rerecord: None,
              bound: Bound::default(),
@@ -456,7 +446,7 @@ index 8495e82f..e52c38a7 100644
              drawn: clear_reach::DrawnArea::default(),
              inline: false,
              continues: false,
-@@ -6365,12 +6419,13 @@ impl RenderLowering {
+@@ -6365,12 +6409,13 @@ impl RenderLowering {
      /// it ([`install`](Self::install), `render/reroute.rs`): never submitted,
      /// a deferred one is never replayed, and one of the pool's ends so the pool goes back to the
      /// device's spares unreset (`CommandBuffer::give_up_raw`). One with pieces (the secondaries
@@ -472,7 +462,7 @@ index 8495e82f..e52c38a7 100644
              || instance.draws == vk::CommandBuffer::null()
              || instance.inline
          {
-@@ -8324,7 +8379,7 @@ impl RenderLowering {
+@@ -8324,7 +8369,7 @@ impl RenderLowering {
          let kept_state = shape_token.and_then(|token| self.shape_memo.state(token, &variant));
          let reused_state = kept_state.is_some();
          let ShapedState {
@@ -481,7 +471,7 @@ index 8495e82f..e52c38a7 100644
              viewports,
              depth,
          } = match kept_state {
-@@ -8348,6 +8403,42 @@ impl RenderLowering {
+@@ -8348,6 +8393,42 @@ impl RenderLowering {
                  shaped
              }
          };
@@ -524,7 +514,7 @@ index 8495e82f..e52c38a7 100644
          let fixed = draw_state.fixed;
          // A rate-mapped pass records the draw once per region of the map's layer of the slice
          // it renders (`rate_mapped_pass.rs`): each amplification drawn one at a time its own
-@@ -8586,6 +8677,31 @@ impl RenderLowering {
+@@ -8586,6 +8667,31 @@ impl RenderLowering {
                  draw_pipeline
              }
          };
@@ -556,7 +546,7 @@ index 8495e82f..e52c38a7 100644
          if reused_state && reused_pipeline {
              device.shared().counts.draw_shape_reused();
          }
-@@ -9399,6 +9515,40 @@ impl RenderLowering {
+@@ -9399,6 +9505,32 @@ impl RenderLowering {
                      None => (&pushes[a][..], vk_draws),
                  }
              };
@@ -578,14 +568,6 @@ index 8495e82f..e52c38a7 100644
 +                        let compatible = Arc::clone(&self.current.compatible);
 +                        self.current.prepass =
 +                            self.core.command_buffer().begin_draws(&compatible)?;
-+                        if self.earlier.is_empty() {
-+                            let raw = self.core.device().shared().vk();
-+                            opaque_prepass::clear_depth(
-+                                raw,
-+                                self.current.prepass,
-+                                self.layout.extent,
-+                            );
-+                        }
 +                    }
 +                    self.prepass.retain(&mut self.core, made);
 +                    let mut state = draw_states.of(0)[0].clone();
@@ -597,7 +579,7 @@ index 8495e82f..e52c38a7 100644
              for &phase in phases {
                  let mut first = true;
                  // Amplification by amplification, each through its recordings' regions: Metal
-@@ -9482,6 +9632,23 @@ impl RenderLowering {
+@@ -9482,6 +9614,23 @@ impl RenderLowering {
                                              replayed.record(&recording, bound, &replay_holes)
                                          },
                                          None => unsafe { recording.record(bound) },
@@ -657,10 +639,10 @@ index 6eb8b140..88de1579 100644
              drawn_before: snapshot.drawn.clone(),
 diff --git a/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
 new file mode 100644
-index 00000000..49ec79e4
+index 00000000..2d302103
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,208 @@
 +//! The depth prepass of a pass's opaque draws: hidden-surface removal for a pass without a depth
 +//! attachment.
 +//!
@@ -672,12 +654,10 @@ index 00000000..49ec79e4
 +//!   (a trace of an Adreno 810's passes, 8.4 G samples) lay under a later opaque draw that
 +//!   covered the whole pass.
 +//! - **How.** Such a pass renders with a depth attachment of its own, which Metal does not see
-+//!   (`attachment_stand_in::prepass_depth`, [`DepthStencilTarget::prepass`]): cleared to 1.0 by
-+//!   the first instance's prepass before any draw ([`clear_depth`], a clear inside the subpass,
-+//!   not as the pass loads it), never stored. Each draw takes the depth of its place in the
-+//!   pass, a code of that 16-bit depth nearer than every earlier draw's
-+//!   ([`Prepass::next_depth`]), through its viewports' collapsed depth range, which leaves its
-+//!   rasterization alone. Each draw that hides
++//!   (`attachment_stand_in::prepass_depth`, [`DepthStencilTarget::prepass`]): cleared to 1.0 as
++//!   the pass begins, never stored. Each draw takes the depth of its place in the pass, a code of
++//!   that 16-bit depth nearer than every earlier draw's ([`Prepass::next_depth`]), through its
++//!   viewports' collapsed depth range, which leaves its rasterization alone. Each draw that hides
 +//!   what it covers ([`Role::Occludes`]) records twice: once into the instance's prepass, a
 +//!   secondary command buffer every instance's subpass runs before its draws, with its colors
 +//!   masked, the depth test `LESS` and depth writes; and once among the instance's draws, as
@@ -711,7 +691,6 @@ index 00000000..49ec79e4
 +use crate::pipeline::RawPipeline;
 +use crate::render_pass::{DepthStencilTarget, PassLayout, Target};
 +use crate::render_values::StoreAction;
-+use ash::vk;
 +use metal2vulkan::pipeline::{ColorAttachmentState, GraphicsState};
 +use metal2vulkan::vk::ColorComponentFlags;
 +use std::sync::Arc;
@@ -872,36 +851,8 @@ index 00000000..49ec79e4
 +pub(super) fn target(image: Target) -> DepthStencilTarget {
 +    DepthStencilTarget::prepass(image)
 +}
-+
-+/// Record into `prepass`, the prepass of a pass's first instance before any of its draws, the
-+/// clear of the prepass's depth to 1.0 over the pass's `extent`: the first instance loads it
-+/// `DONT_CARE`, and each later one loads what the one before stored.
-+pub(super) fn clear_depth(raw: &ash::Device, prepass: vk::CommandBuffer, [width, height]: [u32; 2]) {
-+    let attachments = [vk::ClearAttachment {
-+        aspect_mask: vk::ImageAspectFlags::DEPTH,
-+        color_attachment: 0,
-+        clear_value: vk::ClearValue {
-+            depth_stencil: vk::ClearDepthStencilValue {
-+                depth: 1.0,
-+                stencil: 0,
-+            },
-+        },
-+    }];
-+    let rects = [vk::ClearRect {
-+        rect: vk::Rect2D {
-+            offset: vk::Offset2D { x: 0, y: 0 },
-+            extent: vk::Extent2D { width, height },
-+        },
-+        base_array_layer: 0,
-+        layer_count: 1,
-+    }];
-+    // SAFETY: `prepass` is a secondary command buffer recording inside the pass's subpass, which
-+    // has the prepass depth as its depth attachment; the rectangle is the pass's render area,
-+    // its one layer.
-+    unsafe { raw.cmd_clear_attachments(prepass, &attachments, &rects) };
-+}
 diff --git a/crates/metal2vulkan-runtime/src/render_pass.rs b/crates/metal2vulkan-runtime/src/render_pass.rs
-index 210b283b..adcbaf42 100644
+index 210b283b..f4a2ebe4 100644
 --- a/crates/metal2vulkan-runtime/src/render_pass.rs
 +++ b/crates/metal2vulkan-runtime/src/render_pass.rs
 @@ -912,8 +912,11 @@ pub(super) struct DepthStencilTarget {
@@ -917,7 +868,7 @@ index 210b283b..adcbaf42 100644
  }
  
  impl DepthStencilTarget {
-@@ -948,6 +951,32 @@ impl DepthStencilTarget {
+@@ -948,6 +951,30 @@ impl DepthStencilTarget {
              depth_filter: MultisampleDepthResolveFilter::default(),
              stencil_filter: MultisampleStencilResolveFilter::default(),
              hidden: true,
@@ -932,10 +883,8 @@ index 210b283b..adcbaf42 100644
 +    /// so no draw's depth bias follows it.
 +    pub(super) fn prepass(target: Target) -> DepthStencilTarget {
 +        DepthStencilTarget {
-+            // Cleared by a draw-path clear in the first instance's prepass, not by the load
-+            // (`opaque_prepass::clear_depth`).
 +            depth: Some(AspectTarget {
-+                load: LoadAction::DontCare,
++                load: LoadAction::Clear,
 +                store: StoreAction::DontCare,
 +                late_store: false,
 +                options: StoreActionOptions::NONE,
@@ -950,7 +899,7 @@ index 210b283b..adcbaf42 100644
          }
      }
  }
-@@ -1030,8 +1059,10 @@ impl Clone for PassLayout {
+@@ -1030,8 +1057,10 @@ impl Clone for PassLayout {
  impl PassLayout {
      /// Whether the pass has a depth and a stencil: of its attachments, or the hidden ones a draw
      /// or an execution gave it.
@@ -962,7 +911,7 @@ index 210b283b..adcbaf42 100644
              (ds.depth.is_some(), ds.stencil.is_some())
          })
      }
-@@ -2321,6 +2352,7 @@ fn depth_stencil(
+@@ -2321,6 +2350,7 @@ fn depth_stencil(
          depth_filter: d.depth_resolve_filter,
          stencil_filter: s.stencil_resolve_filter,
          hidden: false,
