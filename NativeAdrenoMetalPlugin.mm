@@ -5,19 +5,24 @@
 // Published (the image carries the file NativeAdrenoMetal.publish beside the bundle): backboardd, the one process that owns the GPU, returns the native
 // Metal frontend's device (the metal2vulkan runtime on Turnip, on the Adreno 740), which the original discovery registers; the CARenderServer then
 // renders the system UI through it, and the display driver's frames are written to the scanout by the GPU (GpuScanoutClient.h). Another process
-// gets its own native device (its own driver connection, GPU address window and shader cache) when its name is listed in the file
-// NativeAdrenoMetal.clients beside the bundle ("*" lists every process); an unlisted one returns nil and keeps the software renderer.
+// gets its own native device too (its own driver connection, GPU address space and shader cache), as every process does with Apple's
+// own GPU plugin.
 #import <Foundation/Foundation.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#if __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#endif
 #include <unistd.h>
 #include <pwd.h>
+#include <fts.h>
 #include <mach/mach.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "PrimeShaders.h"
+#include "CacheImport.h"
 #include "ExceptionDiag.h"
 
 @interface _MTLDevice : NSObject
@@ -109,6 +114,10 @@ static void markSample(Gpu &gpu, const DisplaySample &x, unsigned base) {
     gpu.mark((base + 0x2000) | (x.mode << 4) | x.behaviour);     // mode colour field, ICC/other behaviour bytes
 }
 static void reportDisplayState(Gpu &gpu) {
+#if defined(__arm64e__)
+    (void)gpu;
+    return;   // the addresses above are the 21H461 cache's; the arm64e (iPadOS 27) build must not read or write them
+#endif
     ++gReports;
     static DisplaySample before;
     static bool changed;
@@ -136,40 +145,36 @@ static void reportDisplayState(Gpu &gpu) {
         markSample(gpu, now, 0xA000);
     } @catch (NSException *) {}
 }
-// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process; a
-// name that ends in "*" names every process whose name starts with it, so "com.apple.WebKit.*" covers the WebContent, Networking
-// and GPU service processes).
-static bool listedClient() {
-    char path[1024];
-    if (!requestedPath("NativeAdrenoMetal.clients", path, sizeof path)) return false;
-    FILE *file = fopen(path, "r");
-    if (!file) return false;
-    char text[1024] = {};
-    const size_t length = fread(text, 1, sizeof text - 1, file);
-    fclose(file);
-    text[length] = 0;
-    const char *self = getprogname();
-    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save)) {
-        if (!strcmp(name, "*") || !strcmp(name, self)) return true;
-        const size_t nameLength = strlen(name);
-        if (nameLength && name[nameLength - 1] == '*' && !strncmp(name, self, nameLength - 1)) return true;
-    }
-    return false;
-}
-// A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
+// Every process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
 // "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
+// Deletes every "*.import" file under `root`: the copying import of an earlier image wrote each file beside its place and renamed it only
+// once the whole pack was read; a boot that ended first left them all there.
+static void removeHalfImported(const char *root) {
+    char *paths[] = {const_cast<char *>(root), nullptr};
+    FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
+    if (!fts) return;
+    while (FTSENT *e = fts_read(fts))
+        if (e->fts_info == FTS_F && e->fts_namelen > 7 && !strcmp(e->fts_name + e->fts_namelen - 7, ".import")) unlink(e->fts_path);
+    fts_close(fts);
+}
 static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
+        // The row holds 63 characters: the common prefix goes, and a long reason keeps its start (what was refused) and its end (why).
+        if (!detail) detail = "";
+        if (!strncmp(detail, "native-metal: ", 14)) detail += 14;
+        char shown[48];
+        const size_t length = strlen(detail);
+        if (length <= 46) strlcpy(shown, detail, sizeof shown);
+        else snprintf(shown, sizeof shown, "%.18s~%s", detail, detail + length - 27);
         char text[64];
-        snprintf(text, sizeof text, "%.14s %.46s", step, detail ? detail : "");
+        snprintf(text, sizeof text, "%.14s %s", step, shown);
         streamText(*gpu, text);
     }
 }
 static id clientDevice(unsigned port) {
-    if (!listedClient()) return nil;
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
     uint64_t registryID = 0;
@@ -199,6 +204,17 @@ static id clientDevice(unsigned port) {
         }
         if (!device && !lastError[0]) lastError = nmb_last_error();
     }
+    if (!device && !usable) {
+        setenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL", "1", 1);
+        const char *path = candidates[0][0] ? candidates[0] : candidates[1][0] ? candidates[1] : "/var/mobile/tmp/m2v";
+        @try {
+            device = native_bridge_metal_open(turnip, path, registryID, nullptr);
+        } @catch (NSException *exception) {
+            device = nil;
+            lastError = "exception";
+        }
+        if (!device && !lastError[0]) lastError = nmb_last_error();
+    }
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
     // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render
     // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
@@ -222,6 +238,11 @@ static id deviceForPort(unsigned port) {
         // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
         // runtime keeps within a texture's rows (bridge patch 0016).
+        if (FILE *flags = fopen("/private/var/ngpu/tu_debug", "r")) {
+            char line[128] = {};
+            if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
+            fclose(flags);
+        }
         setenv("TU_DEBUG", "nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
@@ -264,6 +285,24 @@ static id deviceForPort(unsigned port) {
         }
         // The render server compresses its framebuffer (an Apple/AGX layout this GPU does not write) unless told not to; the display driver takes plain rows.
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+#if defined(__arm64e__)
+        // iPadOS 27 picks a 64-bit half-float framebuffer ('RGhA') whenever the display's EDR headroom is above 1 (this panel reports XDR
+        // headroom), which the display path can only show converted, slowly and greyed. As on iPadOS 17, where the render server drew plain
+        // 8-bit BGRA, the headroom is held at 1: the render server's headroom override (CA::WindowServer::Display::edr_headroom reads it
+        // first when nonzero; 24A446 QuartzCore __DATA_DIRTY 0x1e7021014, CARenderServerStart at 0x1846dce88 for the cache slide) and its
+        // environment spelling for an option table read after this.
+        setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
+        if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
+            const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
+            const float one = 1.0f;
+            gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
+        }
+#endif
+        // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
+        // its MetalContext). A Vulkan queue's priority is fixed when the device opens, before that call, so the render server asks the
+        // runtime for it here (patches/metal2vulkan/0012): where the host offers priorities, its frames no longer wait on the GPU behind
+        // an app's.
+        setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums.
         setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -288,6 +327,30 @@ static id deviceForPort(unsigned port) {
             strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
+            // The pipeline caches compiled ahead on the host, read on demand from the userdata import region behind this directory
+            // (CacheImport.h), and the files an earlier image's copying import left half written there (int 590aaee2), which hold memory
+            // of the RAM Data disk.
+            {
+                static bool once;
+                if (!once) {
+                    once = true;
+                    removeHalfImported(candidates[i]);
+                    if (cacheimport::open(*gpu)) {
+                        nmb_set_shader_cache_fallback(cacheimport::read);
+                        uint8_t *done = nullptr;
+                        size_t length = 0;
+                        if (cacheimport::read("prime-done", &done, &length)) {
+                            const std::string text(reinterpret_cast<const char *>(done), length);
+                            free(done);
+                            for (size_t at = 0, end; at < text.size(); at = end + 1) {
+                                end = text.find('\n', at);
+                                if (end == std::string::npos) end = text.size();
+                                if (end > at) prime::extraDone().insert(text.substr(at, end - at));
+                            }
+                        }
+                    }
+                }
+            }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.
             if (char pack[1024]; requestedPath("NativeAdrenoMetal.m2vpack", pack, sizeof pack)) {

@@ -11,6 +11,9 @@
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
 
+// The system allocator: mimalloc reserved its arenas with large mmaps, and on iPadOS 27 the kernel stopped the render server and
+// SpringBoard with an exception inside that mmap (unix_mmap_prim_aligned from mi_arena_reserve), so the shell resprung.
+
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
@@ -86,7 +89,6 @@ fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
     let mut options = DeviceOptions::default();
     options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
     options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
-    options.refuse_rebinds = true;
     Device::system_default_with(&options).map_err(|e| format!("device: {e:?}"))
 }
 

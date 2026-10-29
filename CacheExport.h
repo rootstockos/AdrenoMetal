@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
@@ -144,6 +145,8 @@ struct PackReader {
     using InflateFn = int (*)(z_streamp, int);
     using EndFn = int (*)(z_streamp);
     FILE *in = nullptr;
+    // Where the compressed bytes come from: the pack file, or the import region (importRegion).
+    std::function<bool(void *, size_t)> source;
     z_stream z = {};
     InflateFn inflateFn = nullptr;
     EndFn endFn = nullptr;
@@ -152,18 +155,25 @@ struct PackReader {
     uint8_t input[65536];
     ~PackReader() {if (open) endFn(&z); if (in) fclose(in);}
     bool start(const char *path) {
+        if (!(in = fopen(path, "rb"))) return false;
+        struct stat st = {};
+        if (fstat(fileno(in), &st) != 0 || (uint64_t)st.st_size > kPackLimit) return false;
+        FILE *file = in;
+        return startWith([file](void *out, size_t n) {return fread(out, 1, n, file) == n;}, (uint64_t)st.st_size);
+    }
+    // A pack of `bytes` bytes (its 16-byte head included) that `read` hands out in order.
+    bool startWith(std::function<bool(void *, size_t)> read, uint64_t bytes) {
         static void *lib = dlopen("/usr/lib/libz.1.dylib", RTLD_NOW | RTLD_LOCAL);
         auto init = lib ? (InitFn)dlsym(lib, "inflateInit_") : nullptr;
         inflateFn = lib ? (InflateFn)dlsym(lib, "inflate") : nullptr;
         endFn = lib ? (EndFn)dlsym(lib, "inflateEnd") : nullptr;
-        if (!init || !inflateFn || !endFn || !(in = fopen(path, "rb"))) return false;
-        struct stat st = {};
+        source = std::move(read);
         uint8_t head[16];
         uint32_t raw = 0, zbytes = 0;
-        if (fstat(fileno(in), &st) != 0 || (uint64_t)st.st_size > kPackLimit || fread(head, 1, 16, in) != 16 || memcmp(head, "SHEXP001", 8)) return false;
+        if (!init || !inflateFn || !endFn || !source(head, 16) || memcmp(head, "SHEXP001", 8)) return false;
         memcpy(&raw, head + 8, 4);
         memcpy(&zbytes, head + 12, 4);
-        if ((uint64_t)zbytes != (uint64_t)st.st_size - 16) return false;
+        if ((uint64_t)zbytes != bytes - 16) return false;
         left = zbytes; expect = raw;
         open = init(&z, ZLIB_VERSION, (int)sizeof z) == Z_OK;
         return open;
@@ -175,7 +185,7 @@ struct PackReader {
             if (ended) return false;
             if (!z.avail_in && left) {
                 const size_t want = left < sizeof input ? (size_t)left : sizeof input;
-                if (fread(input, 1, want, in) != want) return false;
+                if (!source(input, want)) return false;
                 left -= want;
                 z.next_in = input;
                 z.avail_in = (uInt)want;
@@ -205,10 +215,14 @@ struct PackReader {
 // scripts/add-gpu-plugin-data.py --pipeline-pack). Its files go into this process's own cache directory, so they carry this process's owner
 // and mode; a file that is already there with the same size is kept. Files are written beside their place and renamed only once the
 // whole pack has been read and checked: a damaged pack imports nothing. Returns the number of files written, or -1.
+static int importStream(PackReader &r, const std::string &directory);
 static int importPack(const char *pack, const std::string &directory) {
     if (access(pack, R_OK) != 0) return 0;
     PackReader r;
     if (!r.start(pack)) return -1;
+    return importStream(r, directory);
+}
+static int importStream(PackReader &r, const std::string &directory) {
     std::vector<std::string> written;
     auto fail = [&]() {for (const std::string &f : written) unlink((f + ".import").c_str()); return -1;};
     char magic[8];

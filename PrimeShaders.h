@@ -36,6 +36,7 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 // saw in 250 ms.
 extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made, native_prime_rate;}
 
+extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
 
@@ -288,9 +289,13 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
     return path + line + firstRefusal;
 }
 
+// Libraries finished elsewhere (the pipeline caches compiled ahead on the host, CacheImport.h), in prime-done's line form.
+static std::set<std::string> &extraDone() {static std::set<std::string> lines; return lines;}
+
 // The thread: waits for the desktop to settle, then works through the libraries not finished yet.
 static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, const std::string &listPath) {
     pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+    native_bridge_metal_quiet_problems(true);
     while (root.size() > 1 && root.back() == '/') root.pop_back();
     const std::string donePath = root + "/prime-done", badPath = root + "/prime-bad", current = root + "/prime-current",
                       logPath = root + "/prime.log";
@@ -300,6 +305,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     sleep(delaySeconds);
     const std::set<std::string> bad = readLines(badPath);
     std::set<std::string> done = readLines(donePath);
+    done.insert(extraDone().begin(), extraDone().end());
     const uint64_t began = nowMs();
     unsigned libs = 0, finished = 0;
     std::string note;
