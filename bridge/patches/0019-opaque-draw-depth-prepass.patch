@@ -112,8 +112,75 @@ index 35ddfb92..121f84a1 100644
  /// The clear of a pass's hidden depth and stencil (`hidden`) to Metal's 1.0 and 0, every layer of
  /// its image, recorded before the pass: each of the pass's instances loads it.
  pub(super) struct HiddenClear {
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+index ab57509d..850d4acc 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/graphics.rs
+@@ -180,6 +180,11 @@ pub(crate) struct FixedState {
+     /// without a depth attachment): its fragments write no color attachment, so every
+     /// attachment's write mask is empty.
+     pub(crate) masks_color: bool,
++    /// A draw that only writes the depth its rasterization gives (an opaque draw's prepass,
++    /// `render/opaque_prepass.rs`): the pipeline has no fragment stage. Set only where the fragment
++    /// function writes no depth or memory and drops no sample it covers
++    /// (`GraphicsState::fragment_discards`), so the depth it leaves is the draw's.
++    pub(crate) depth_only: bool,
+     /// A draw under Apple's last provoking vertex (`setProvokingVertexMode:` 1) on a device
+     /// that draws it natively (`render/provoking.rs`): the rasterization state chains
+     /// `VkPipelineRasterizationProvokingVertexStateCreateInfoEXT` with
+@@ -346,6 +351,8 @@ pub(crate) struct GraphicsContent {
+     /// (`GraphicsState::snapshot_reads`, `render/snapshot.rs`): made whole, with
+     /// `VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT`.
+     feedback_loop: bool,
++    /// A depth-only pipeline (`FixedState::depth_only`): no fragment stage, made whole.
++    depth_only: bool,
+ }
+ 
+ /// One stage of a [`GraphicsContent`]: its index among the variant's modules, its flags, its
+@@ -477,12 +484,13 @@ impl<'a> Infos<'a> {
+ 
+ impl GraphicsContent {
+     /// Whether its pipeline links from the four libraries: one with vertex input that rasterizes
+-    /// (a mesh pipeline, or one that discards every primitive, is made whole), and that reads no
+-    /// texture through a snapshot, whose creation flag is made whole too ([`feedback_loop`]).
++    /// (a mesh pipeline, or one that discards every primitive, is made whole), that reads no
++    /// texture through a snapshot, whose creation flag is made whole too ([`feedback_loop`]),
++    /// and that has its fragment stage (a depth-only one is made whole).
+     ///
+     /// [`feedback_loop`]: GraphicsContent::feedback_loop
+     pub(crate) fn links(&self) -> bool {
+-        !self.meshes && !self.rasterizer_discard && !self.feedback_loop
++        !self.meshes && !self.rasterizer_discard && !self.feedback_loop && !self.depth_only
+     }
+ 
+     /// The digest of each part's state, in [`Part::ALL`]'s order: the names of its libraries
+@@ -983,6 +991,8 @@ impl VariantObjects {
+             .filter(|(at, (_, object))| {
+                 object.stage != vk::ShaderStageFlags::COMPUTE
+                     && pipeline.runs_stage(*at, key.topology)
++                    // A depth-only pipeline has no fragment stage (`FixedState::depth_only`).
++                    && !(key.fixed.depth_only && object.stage == vk::ShaderStageFlags::FRAGMENT)
+             })
+             .map(|(at, (stage, _))| StageState {
+                 at,
+@@ -1107,6 +1117,7 @@ impl VariantObjects {
+                 .iter()
+                 .any(|stage| stage.stage == metal2vulkan::vk::ShaderStage::MESH_EXT),
+             feedback_loop: graphics.snapshot_reads,
++            depth_only: key.fixed.depth_only,
+         })
+     }
+ 
+@@ -1377,6 +1388,7 @@ mod tests {
+             viewports: 1,
+             depth_range: None,
+             masks_color: false,
++            depth_only: false,
+             provoking_last: false,
+         }
+     }
 diff --git a/crates/metal2vulkan-runtime/src/pipeline/predicted.rs b/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
-index f15d951a..88ba19c4 100644
+index f15d951a..eedca073 100644
 --- a/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
 +++ b/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
 @@ -45,6 +45,8 @@
@@ -177,7 +244,7 @@ index f15d951a..88ba19c4 100644
 +            && opaque_prepass::occludes_alone(graphics))
 +        .then(|| GraphicsKey {
 +            fixed: FixedState::without_dynamic(
-+                opaque_prepass::prepass_fixed(fixed),
++                opaque_prepass::prepass_fixed(fixed, graphics),
 +                &graphics.dynamic_states,
 +            ),
 +            ..key.clone()
@@ -284,7 +351,7 @@ index 641a8a58..c62bb218 100644
              }
              pending.push(ticket.pending());
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index 8495e82f..6f88f7ad 100644
+index 8495e82f..3e9f8711 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
 @@ -398,6 +398,7 @@ mod late_resolve;
@@ -523,7 +590,7 @@ index 8495e82f..6f88f7ad 100644
 +        // or made now, where the draw's own is made.
 +        let prepass_made = match (role, &draw_pipeline) {
 +            (opaque_prepass::Role::Occludes, DrawPipeline::Made(_)) => {
-+                let prepass_fixed = opaque_prepass::prepass_fixed(fixed);
++                let prepass_fixed = opaque_prepass::prepass_fixed(fixed, graphics);
 +                let key = DrawKey {
 +                    fixed: FixedState::without_dynamic(prepass_fixed, &graphics.dynamic_states),
 +                    ..draw_key()
@@ -579,7 +646,7 @@ index 8495e82f..6f88f7ad 100644
              for &phase in phases {
                  let mut first = true;
                  // Amplification by amplification, each through its recordings' regions: Metal
-@@ -9482,6 +9614,23 @@ impl RenderLowering {
+@@ -9482,6 +9614,26 @@ impl RenderLowering {
                                              replayed.record(&recording, bound, &replay_holes)
                                          },
                                          None => unsafe { recording.record(bound) },
@@ -600,6 +667,9 @@ index 8495e82f..6f88f7ad 100644
 +                                        let bound = &mut self.current.prepass_bound;
 +                                        states_recorded += unsafe { prepass.record(bound) };
 +                                        device.shared().counts.opaque_prepass_draw();
++                                        if state.fixed.depth_only {
++                                            device.shared().counts.opaque_prepass_depth_only();
++                                        }
                                      }
                                  }
                                  (None, _) => owned.push(recording.owned()),
@@ -639,10 +709,10 @@ index 6eb8b140..88de1579 100644
              drawn_before: snapshot.drawn.clone(),
 diff --git a/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
 new file mode 100644
-index 00000000..2d302103
+index 00000000..ccef9f72
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,213 @@
 +//! The depth prepass of a pass's opaque draws: hidden-surface removal for a pass without a depth
 +//! attachment.
 +//!
@@ -660,7 +730,9 @@ index 00000000..2d302103
 +//!   viewports' collapsed depth range, which leaves its rasterization alone. Each draw that hides
 +//!   what it covers ([`Role::Occludes`]) records twice: once into the instance's prepass, a
 +//!   secondary command buffer every instance's subpass runs before its draws, with its colors
-+//!   masked, the depth test `LESS` and depth writes; and once among the instance's draws, as
++//!   masked, the depth test `LESS` and depth writes, and no fragment stage where its fragment
++//!   function drops no sample it covers (`FixedState::depth_only`: the prepass then costs its
++//!   rasterization alone); and once among the instance's draws, as
 +//!   every draw records, with the depth test `LESS_OR_EQUAL` and no depth write. After the
 +//!   prepass each pixel holds the depth of the last opaque draw that covers it, so in the draws a
 +//!   fragment passes only where no later opaque draw covers it: what Metal shows, each covered
@@ -836,10 +908,13 @@ index 00000000..2d302103
 +        && g.color_attachments.iter().flatten().all(opaque)
 +}
 +
-+/// `fixed`, a draw's fixed state, as the prepass records the draw: its colors masked, the depth
-+/// tested `LESS` and written.
-+pub(crate) fn prepass_fixed(mut fixed: FixedState) -> FixedState {
++/// `fixed`, a draw's fixed state, as the prepass records the draw of `g`: its colors masked, the
++/// depth tested `LESS` and written, and with no fragment stage where its fragment function drops
++/// no sample it covers and no alpha coverage does ([`FixedState::depth_only`]): the prepass then
++/// costs the draw's rasterization alone, not its fragment function again.
++pub(crate) fn prepass_fixed(mut fixed: FixedState, g: &GraphicsState) -> FixedState {
 +    fixed.masks_color = true;
++    fixed.depth_only = !g.fragment_discards && !g.alpha_to_coverage;
 +    let ds = &mut fixed.depth_stencil;
 +    ds.depth_test_enable = true;
 +    ds.depth_write_enable = true;
@@ -919,6 +994,18 @@ index 210b283b..f4a2ebe4 100644
      }))
  }
  
+diff --git a/crates/metal2vulkan-runtime/src/render_state.rs b/crates/metal2vulkan-runtime/src/render_state.rs
+index a5efa4e4..b1ed7e67 100644
+--- a/crates/metal2vulkan-runtime/src/render_state.rs
++++ b/crates/metal2vulkan-runtime/src/render_state.rs
+@@ -1122,6 +1122,7 @@ impl EncoderState {
+             viewports,
+             depth_range: None,
+             masks_color: false,
++            depth_only: false,
+             provoking_last: false,
+         })
+     }
 diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
 index 9d0706db..644e5416 100644
 --- a/crates/metal2vulkan-runtime/src/render_target.rs
@@ -948,10 +1035,10 @@ index cbeec393..3841c8a6 100644
  mod own;
 diff --git a/crates/metal2vulkan-runtime/src/tests/opaque_prepass.rs b/crates/metal2vulkan-runtime/src/tests/opaque_prepass.rs
 new file mode 100644
-index 00000000..1d979720
+index 00000000..6e1d19ab
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/tests/opaque_prepass.rs
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,486 @@
 +//! A pass of colors alone that stacks blended and opaque layers renders its opaque draws' depth
 +//! prepass (`render/opaque_prepass.rs`): every opaque draw records into its instance's prepass too
 +//! (`WorkCounts::opaque_prepass_draws`), and the target holds what the draws show in order, each
@@ -1164,9 +1251,14 @@ index 00000000..1d979720
 +    command_buffer.commit().unwrap();
 +    command_buffer.wait_until_completed_for(WAIT).unwrap();
 +    assert_eq!(command_buffer.error(), None);
-+    // The path ran: each of the three opaque layers recorded into the prepass.
++    // The path ran: each of the three opaque layers recorded into the prepass, with no fragment
++    // stage (`tob_solid` drops no sample it covers).
 +    let after = device.work_counts();
 +    assert_eq!(after.opaque_prepass_draws - counted.opaque_prepass_draws, 3);
++    assert_eq!(
++        after.opaque_prepass_depth_only - counted.opaque_prepass_depth_only,
++        3
++    );
 +    let contents = back.contents().unwrap();
 +    // SAFETY: the buffer's bytes, which no command uses now.
 +    let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), back.length() as usize) };
@@ -1294,9 +1386,7 @@ index 00000000..1d979720
 +        assert_eq!(command_buffer.error(), None);
 +    }
 +    // The path ran: every opaque layer of every pass recorded into its prepass.
-+    let opaque_layers: u64 = (plans.iter().flatten())
-+        .filter(|layer| !layer.3)
-+        .count() as u64;
++    let opaque_layers: u64 = (plans.iter().flatten()).filter(|layer| !layer.3).count() as u64;
 +    let after = device.work_counts();
 +    assert_eq!(
 +        after.opaque_prepass_draws - counted.opaque_prepass_draws,
@@ -1324,19 +1414,131 @@ index 00000000..1d979720
 +        }
 +    }
 +}
++
++/// The fixture's state of `discard_counts_full` and `discard_counts`
++/// (`validation/fixtures/public/engine/fragment_discard_counts.ll`), one `RGBA32Sint` target.
++fn discard_state(device: &Device) -> RenderPipelineState {
++    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../metal2vulkan-validation/fixtures/public/engine/fragment_discard_counts.ll");
++    let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
++    let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
++    let library = device.new_library_with_compile_library(library);
++    let vertex = library
++        .new_function_with_name("discard_counts_full")
++        .unwrap();
++    let fragment = library.new_function_with_name("discard_counts").unwrap();
++    let mut descriptor =
++        RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
++    descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
++    descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA32Sint));
++    device
++        .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
++        .unwrap()
++}
++
++/// Whether `discard_counts` keeps pixel `(x, y)` under its `whole` argument: `0` keeps the even
++/// columns, `1` the quads of a checkerboard of 2x2 quads.
++fn kept(whole: u32, x: u64, y: u64) -> bool {
++    match whole {
++        0 => x & 1 == 0,
++        _ => ((x >> 1) + (y >> 1)) & 1 == 0,
++    }
++}
++
++#[test]
++fn an_opaque_draw_that_discards_hides_only_what_it_keeps() {
++    let scratch = Scratch::new();
++    let device = device(&scratch.0);
++    let queue = device.new_command_queue().unwrap();
++    let state = discard_state(&device);
++    let mut d = TextureDescriptor::texture_2d(PixelFormat::RGBA32Sint, SIDE, SIDE, false);
++    d.usage = TextureUsage::RENDER_TARGET;
++    d.resource_options = ResourceOptions::private();
++    let target = device.new_texture(&d).unwrap();
++    let back = device
++        .new_buffer(SIDE * SIDE * 16, ResourceOptions::shared())
++        .unwrap();
++    let mut pass = RenderPassDescriptor::new();
++    let color = &mut pass.color_attachments[0];
++    color.texture = Some(target.clone());
++    color.load_action = LoadAction::Clear;
++    color.store_action = StoreAction::Store;
++    // Both draws opaque and full screen: the checkerboard's quads first, then the even columns
++    // over them. Where the second discards, the first shows wherever it kept the pixel.
++    let draws = |encoder: &mut RenderCommandEncoder| {
++        encoder.set_render_pipeline_state(&state).unwrap();
++        for whole in [1u32, 0] {
++            encoder.set_fragment_bytes(&whole.to_le_bytes(), 0).unwrap();
++            encoder
++                .draw_primitives(PrimitiveType::Triangle, 0, 3, 1, 0)
++                .unwrap();
++        }
++    };
++    // A first pass makes the `VkPipeline`s (`render/pending.rs`).
++    let first = queue.command_buffer().unwrap();
++    let mut encoder = first.render_command_encoder(&pass).unwrap();
++    draws(&mut encoder);
++    encoder.end_encoding().unwrap();
++    first.commit().unwrap();
++    first.wait_until_completed_for(WAIT).unwrap();
++    let counted = device.work_counts();
++    let command_buffer = queue.command_buffer().unwrap();
++    let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
++    draws(&mut encoder);
++    encoder.end_encoding().unwrap();
++    let mut blit = command_buffer.blit_command_encoder().unwrap();
++    blit.copy_from_texture_to_buffer(
++        &target,
++        0,
++        0,
++        Origin::new(0, 0, 0),
++        Size::new(SIDE, SIDE, 1),
++        &back,
++        0,
++        SIDE * 16,
++        SIDE * SIDE * 16,
++        BlitOption::None,
++    )
++    .unwrap();
++    blit.end_encoding().unwrap();
++    command_buffer.commit().unwrap();
++    command_buffer.wait_until_completed_for(WAIT).unwrap();
++    assert_eq!(command_buffer.error(), None);
++    // Both drew into the prepass, each through its fragment function: a discard drops samples.
++    let after = device.work_counts();
++    assert_eq!(after.opaque_prepass_draws - counted.opaque_prepass_draws, 2);
++    assert_eq!(
++        after.opaque_prepass_depth_only - counted.opaque_prepass_depth_only,
++        0
++    );
++    let contents = back.contents().unwrap();
++    // SAFETY: the buffer's bytes, which no command uses now.
++    let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), back.length() as usize) };
++    for y in 0..SIDE {
++        for x in 0..SIDE {
++            // A kept pixel's third lane is its simdgroup's lane count before the discard, never
++            // 0; the clear leaves 0.
++            let at = ((y * SIDE + x) * 16 + 8) as usize;
++            let lanes = i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
++            let drawn = kept(0, x, y) || kept(1, x, y);
++            assert_eq!(lanes != 0, drawn, "pixel ({x}, {y}): third lane {lanes}");
++        }
++    }
++}
 diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
-index 1c56ba2c..c77e192e 100644
+index 1c56ba2c..ee73cf17 100644
 --- a/crates/metal2vulkan-runtime/src/work_counts.rs
 +++ b/crates/metal2vulkan-runtime/src/work_counts.rs
-@@ -259,6 +259,7 @@ pub(crate) struct Counters {
+@@ -259,6 +259,8 @@ pub(crate) struct Counters {
      set_zero_sets_reused: AtomicU64,
      set_zero_sets_found: AtomicU64,
      draw_shapes_reused: AtomicU64,
 +    opaque_prepass_draws: AtomicU64,
++    opaque_prepass_depth_only: AtomicU64,
      dispatches_settled_as_before: AtomicU64,
      dispatches_planned_as_before: AtomicU64,
      baked_sampler_dispatches_apart: AtomicU64,
-@@ -1789,6 +1790,12 @@ impl Counters {
+@@ -1789,6 +1791,18 @@ impl Counters {
          self.draw_shapes_reused.fetch_add(1, Ordering::Relaxed);
      }
  
@@ -1346,24 +1548,238 @@ index 1c56ba2c..c77e192e 100644
 +        self.opaque_prepass_draws.fetch_add(1, Ordering::Relaxed);
 +    }
 +
++    /// An opaque-draw prepass draw recorded through a pipeline with no fragment stage
++    /// (`FixedState::depth_only`).
++    pub(crate) fn opaque_prepass_depth_only(&self) {
++        self.opaque_prepass_depth_only.fetch_add(1, Ordering::Relaxed);
++    }
++
      /// A compute encoder's dispatch that took what its last dispatch settled
      /// (`compute::DispatchMemo`).
      pub(crate) fn dispatch_settled_as_before(&self) {
-@@ -4147,6 +4154,9 @@ pub struct WorkCounts {
+@@ -4147,6 +4161,12 @@ pub struct WorkCounts {
      /// derivation announces a notice the device announces at every occurrence
      /// (`DeviceOptions::announce_each`).
      pub draw_shapes_reused: u64,
 +    /// Draws that hide what they cover, recorded into their instance's opaque-draw prepass too
 +    /// (`render/opaque_prepass.rs`): each with its colors masked, the depth tested and written.
 +    pub opaque_prepass_draws: u64,
++    /// Of [`opaque_prepass_draws`](Self::opaque_prepass_draws), those recorded through a pipeline
++    /// with no fragment stage: the draw's fragment function drops no sample it covers.
++    pub opaque_prepass_depth_only: u64,
      /// Compute encoders' dispatches that took the bind state, variant, plan, commands and made
      /// `VkPipeline`s their encoder's last dispatch settled, rather than settling them again:
      /// those of the same pipeline state, dispatch, table (no call changed it since), threadgroup
-@@ -5327,6 +5337,7 @@ impl Device {
+@@ -5327,6 +5347,9 @@ impl Device {
              set_zero_sets_reused: counters.set_zero_sets_reused.load(Ordering::Relaxed),
              set_zero_sets_found: counters.set_zero_sets_found.load(Ordering::Relaxed),
              draw_shapes_reused: counters.draw_shapes_reused.load(Ordering::Relaxed),
 +            opaque_prepass_draws: counters.opaque_prepass_draws.load(Ordering::Relaxed),
++            opaque_prepass_depth_only: (counters.opaque_prepass_depth_only)
++                .load(Ordering::Relaxed),
              dispatches_settled_as_before: (counters.dispatches_settled_as_before)
                  .load(Ordering::Relaxed),
              dispatches_planned_as_before: (counters.dispatches_planned_as_before)
+diff --git a/crates/metal2vulkan/src/cache/codec.rs b/crates/metal2vulkan/src/cache/codec.rs
+index f6750c09..828a3e54 100644
+--- a/crates/metal2vulkan/src/cache/codec.rs
++++ b/crates/metal2vulkan/src/cache/codec.rs
+@@ -1101,7 +1101,8 @@ codec_struct! {
+     CommandWrites { operations, primitive_types }
+     StageInterface {
+         stage, slots, threadgroup, push, descriptors, spec, needs_pointer_translation,
+-        needs_handle_translation, io, tessellation, writes_memory, mesh_records, emulated_payload,
++        needs_handle_translation, io, tessellation, writes_memory, discards, mesh_records,
++        emulated_payload,
+         payload, reaches_command_buffers, command_writes, writes_textures, numbered_samplers,
+         own_pixel_textures,
+         snapshot_textures, private_bytes,
+@@ -1355,7 +1356,8 @@ codec_struct! {
+         writes_point_size, flat_fragment_inputs,
+         clip_distances, writes_depth, reads_barycentric_coord, reads_primitive_id,
+         reads_position_depth,
+-        fragment_writes_memory, color_outputs, sample_mask, shader_tests, snapshot_reads,
++        fragment_writes_memory, fragment_discards, color_outputs, sample_mask, shader_tests,
++        snapshot_reads,
+         color_group, logic_op,
+     }
+     TessellationState {
+diff --git a/crates/metal2vulkan/src/cache/mod.rs b/crates/metal2vulkan/src/cache/mod.rs
+index 521db0f0..924e10ab 100644
+--- a/crates/metal2vulkan/src/cache/mod.rs
++++ b/crates/metal2vulkan/src/cache/mod.rs
+@@ -70,7 +70,7 @@ pub const SEMANTICS_VERSION: u32 = 1922;
+ /// re-typed in an encoded type, its `codec` body or its `envelope`. A variant removed while its tag
+ /// stays unused needs no bump: an entry holding it fails to decode, which is a miss. The commit that
+ /// bumps it says what changed; this comment keeps no history.
+-pub const ARTIFACT_FORMAT_VERSION: u32 = 478;
++pub const ARTIFACT_FORMAT_VERSION: u32 = 479;
+ 
+ /// The version of what this crate's runtime does with a compiled pipeline: instantiating a binding
+ /// plan (`BindingPlan::instantiate_*`: descriptor ranges, push bytes, root, argument, and handle
+diff --git a/crates/metal2vulkan/src/pipeline/api_tests.rs b/crates/metal2vulkan/src/pipeline/api_tests.rs
+index 6052dc5e..4a0cb9fa 100644
+--- a/crates/metal2vulkan/src/pipeline/api_tests.rs
++++ b/crates/metal2vulkan/src/pipeline/api_tests.rs
+@@ -658,6 +658,7 @@ mod serde_round_trips {
+             reads_primitive_id: true,
+             reads_position_depth: true,
+             fragment_writes_memory: true,
++            fragment_discards: true,
+             color_outputs: 0b101,
+             sample_mask: Some(0b1001),
+             shader_tests: Some(crate::pipeline::graphics::ShaderTestsUse {
+diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
+index 678cb8ac..6ab779f8 100644
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -2555,6 +2555,8 @@ fn compile_kept<K>(
+     // The function's own side effects; the `ExecutionStatus` buffer's words (the resident-miss
+     // count's) are the product's.
+     let writes_memory = crate::spirv::requirements::writes_memory(&module)?;
++    // Whether it may discard: a fragment function without a discard writes all it covers.
++    let discards = crate::spirv::requirements::discards(&module);
+     // A fragment function's texture slots read only at the fragment's own pixel.
+     let mut own_pixel_textures = crate::spirv::requirements::own_pixel_textures(&module, m)?;
+     // Those a draw can read through a snapshot an earlier draw of the same primitives took, of a
+@@ -2671,7 +2673,7 @@ fn compile_kept<K>(
+     let interface = stage_interface(
+         &plan,
+         symbols,
+-        writes_memory,
++        (writes_memory, discards),
+         &merged,
+         &function_tables,
+         (reaches_command_buffers, command_writes),
+@@ -2937,7 +2939,7 @@ fn emitted_census(
+ fn stage_interface(
+     plan: &Plan,
+     symbols: crate::pipeline::link::contract::StageSymbols,
+-    writes_memory: bool,
++    (writes_memory, discards): (bool, bool),
+     merged: &std::collections::BTreeSet<crate::pipeline::sym::SlotRef>,
+     function_tables: &std::collections::BTreeSet<u32>,
+     (reaches_command_buffers, command_writes): (bool, crate::pipeline::interface::CommandWrites),
+@@ -2998,6 +3000,7 @@ fn stage_interface(
+         io: plan.families.stage_io.interface.clone(),
+         tessellation: crate::lower::tessellation::interface(plan),
+         writes_memory,
++        discards,
+         mesh_records: crate::lower::mesh::records(&plan.families.mesh),
+         emulated_payload: crate::lower::mesh::emulated_payload(&plan.families.mesh),
+         payload: plan.families.mesh.payload,
+diff --git a/crates/metal2vulkan/src/pipeline/graphics.rs b/crates/metal2vulkan/src/pipeline/graphics.rs
+index 3c105694..d7cc8143 100644
+--- a/crates/metal2vulkan/src/pipeline/graphics.rs
++++ b/crates/metal2vulkan/src/pipeline/graphics.rs
+@@ -227,6 +227,13 @@ pub struct GraphicsState {
+     /// run then leaves nothing another invocation or a later command reads.
+     #[cfg_attr(feature = "serde", serde(default))]
+     pub fragment_writes_memory: bool,
++    /// The fragment function may discard (`StageInterface::discards`) or writes its
++    /// `[[sample_mask]]`, either of which drops samples it covers. `false` for a pipeline
++    /// without a fragment function. Where it is `false`, the function writes every sample its
++    /// primitive covers that the tests pass, so a consumer can stand for the depth a draw writes
++    /// by a pipeline with no fragment stage at all.
++    #[cfg_attr(feature = "serde", serde(default))]
++    pub fragment_discards: bool,
+     /// The color attachments the fragment function may write, as a mask: bit `n` for color
+     /// attachment `n`. Each attachment that a first (`[[color(n)]]`, index 0) output of the
+     /// function names is set, whether the function writes it through an output variable or, for
+@@ -425,6 +432,7 @@ impl GraphicsState {
+             reads_primitive_id: false,
+             reads_position_depth: false,
+             fragment_writes_memory: false,
++            fragment_discards: false,
+             color_outputs: 0,
+             sample_mask: None,
+             shader_tests: None,
+diff --git a/crates/metal2vulkan/src/pipeline/interface.rs b/crates/metal2vulkan/src/pipeline/interface.rs
+index 0fe197ff..6948d94d 100644
+--- a/crates/metal2vulkan/src/pipeline/interface.rs
++++ b/crates/metal2vulkan/src/pipeline/interface.rs
+@@ -307,6 +307,11 @@ pub struct StageInterface {
+     /// Metal's color attachment write.
+     #[cfg_attr(feature = "serde", serde(default))]
+     pub writes_memory: bool,
++    /// The function may end or demote an invocation before its outputs land
++    /// (`spirv::requirements::discards`): Metal's `discard_fragment`. A fragment function without
++    /// one writes every sample its primitive covers.
++    #[cfg_attr(feature = "serde", serde(default))]
++    pub discards: bool,
+     /// A mesh function compiled for a device without `VK_EXT_mesh_shader`: the module is a
+     /// `GLCompute` entry that writes its threadgroups' vertices and primitives as these records,
+     /// which the pipeline's synthesized vertex stage draws.
+diff --git a/crates/metal2vulkan/src/pipeline/link/graphics.rs b/crates/metal2vulkan/src/pipeline/link/graphics.rs
+index 9347645c..9909ffa6 100644
+--- a/crates/metal2vulkan/src/pipeline/link/graphics.rs
++++ b/crates/metal2vulkan/src/pipeline/link/graphics.rs
+@@ -702,6 +702,9 @@ pub fn graphics_state(
+             fs.io.builtins.contains(&StageBuiltin::FragCoord) && fs.io.position_depth
+         }),
+         fragment_writes_memory: fs.is_some_and(|fs| fs.writes_memory),
++        // A written `[[sample_mask]]` drops samples as a discard does.
++        fragment_discards: fs
++            .is_some_and(|fs| fs.discards || fs.io.builtins.contains(&StageBuiltin::SampleMaskOut)),
+         // The storage form's writes join the outputs' once `link::fetch` decided them.
+         color_outputs: 0,
+         sample_mask: None,
+diff --git a/crates/metal2vulkan/src/pipeline/link/tests.rs b/crates/metal2vulkan/src/pipeline/link/tests.rs
+index 910d832d..54157528 100644
+--- a/crates/metal2vulkan/src/pipeline/link/tests.rs
++++ b/crates/metal2vulkan/src/pipeline/link/tests.rs
+@@ -115,6 +115,7 @@ pub(super) fn iface(
+         io: Default::default(),
+         tessellation: None,
+         writes_memory: false,
++        discards: false,
+         mesh_records: None,
+         emulated_payload: None,
+         payload: None,
+diff --git a/crates/metal2vulkan/src/spirv/requirements/mod.rs b/crates/metal2vulkan/src/spirv/requirements/mod.rs
+index 7bee5a43..62040a45 100644
+--- a/crates/metal2vulkan/src/spirv/requirements/mod.rs
++++ b/crates/metal2vulkan/src/spirv/requirements/mod.rs
+@@ -94,7 +94,7 @@ mod writes;
+ 
+ pub use own_pixel::own_pixel_textures;
+ pub use snapshot::{snapshot_copies_alone, snapshot_textures};
+-pub use writes::writes_memory;
++pub use writes::{discards, writes_memory};
+ 
+ #[cfg(test)]
+ mod registry_generated;
+diff --git a/crates/metal2vulkan/src/spirv/requirements/writes.rs b/crates/metal2vulkan/src/spirv/requirements/writes.rs
+index fe053bd3..88d5742c 100644
+--- a/crates/metal2vulkan/src/spirv/requirements/writes.rs
++++ b/crates/metal2vulkan/src/spirv/requirements/writes.rs
+@@ -53,7 +53,7 @@ use crate::pipeline::sym::{PushField, ResourceKind, SyntheticBinding};
+ use crate::spirv::error::{BResult, BuildError, Dangling};
+ use crate::spirv::ids::Value;
+ use crate::spirv::ir::{
+-    BinOp, ConvOp, GlobalKind, Inst, StorageClass, Type, TypedModule, ValueOrigin,
++    BinOp, ConvOp, GlobalKind, Inst, StorageClass, Terminator, Type, TypedModule, ValueOrigin,
+ };
+ 
+ /// Whether module `m` writes memory that another invocation or a later command can read: the
+@@ -87,6 +87,20 @@ pub fn writes_memory(m: &TypedModule) -> BResult<bool> {
+     Ok(false)
+ }
+ 
++/// Whether module `m` may end or demote an invocation before its outputs land: an `OpKill`,
++/// `OpTerminateInvocation` or `OpDemoteToHelperInvocation` anywhere in it, Metal's
++/// `discard_fragment` however lowering spelled it. A fragment function without one writes every
++/// sample its primitive covers, so the samples a draw hides are its coverage alone, whatever the
++/// function computes (`GraphicsState::fragment_discards`).
++pub fn discards(m: &TypedModule) -> bool {
++    m.blocks().iter().any(|b| {
++        matches!(b.term, Terminator::Kill | Terminator::TerminateInvocation)
++            || b.insts
++                .iter()
++                .any(|n| matches!(n.inst, Inst::DemoteToHelperInvocation))
++    })
++}
++
+ /// The storage class of pointer `ptr`.
+ fn class(m: &TypedModule, ptr: Value) -> BResult<StorageClass> {
+     match m.types().get(m.value(ptr)?.ty)? {
