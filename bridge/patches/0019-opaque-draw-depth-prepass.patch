@@ -1,0 +1,1153 @@
+diff --git a/crates/metal2vulkan-runtime/src/attachment_stand_in.rs b/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
+index 35ddfb92..121f84a1 100644
+--- a/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
++++ b/crates/metal2vulkan-runtime/src/attachment_stand_in.rs
+@@ -631,6 +631,109 @@ pub(super) fn hidden(maker: &CommandBuffer, layout: &PassLayout) -> Result<Targe
+     })
+ }
+ 
++/// The depth of a pass's opaque-draw prepass (`render/opaque_prepass.rs`): a private
++/// [`PREPASS_DEPTH_FORMAT`] image of the pass's extent, one sample and one layer, as a
++/// depth/stencil attachment only. Its pass clears it as it begins and stores nothing of it, so no
++/// pass reads what another left, and one image serves every such pass of the extent on
++/// `maker`'s queue, kept in the queue's pool as a memoryless color's backing is
++/// ([`pooled_backing`]): the passes that take it are ordered by their uses of it, as by any
++/// texture's. Refused `Unsupported` where the device lacks the format as a depth attachment.
++pub(super) fn prepass_depth(maker: &CommandBuffer, layout: &PassLayout) -> Result<Target, Error> {
++    let device = maker.device();
++    let profile = device.compile_device().profile();
++    let pixel_format = PREPASS_DEPTH_FORMAT;
++    let usages = [FormatUsage::DepthStencilAttachment].into();
++    let mapping = metal2vulkan::metal::format::vk_format(pixel_format, &usages, profile).map_err(
++        |error| match error {
++            metal2vulkan::error::Error::Unsupported(unsupported) => Error::Unsupported(unsupported),
++            other => Error::Compile(other),
++        },
++    )?;
++    let format = mapping.format;
++    let extent = layout.extent;
++    let shaped = |k: &PooledBacking| {
++        k.pixel_format == pixel_format
++            && k.format == format
++            && k.samples == 1
++            && k.layers == 1
++            && k.extent == extent
++    };
++    let queue = maker.command_queue();
++    {
++        let mut pool = lock(queue.memoryless_backings());
++        pool.takes += 1;
++        let takes = pool.takes;
++        if let Some(found) = pool.kept.iter_mut().find(|k| shaped(k)) {
++            found.taken = takes;
++            let backing = found.backing.clone();
++            drop(pool);
++            maker.hold_own_texture(backing.texture.clone());
++            return Ok(backing);
++        }
++    }
++    let [width, height] = extent;
++    let descriptor = TextureDescriptor {
++        texture_type: TextureType::Type2D,
++        pixel_format,
++        width: width.into(),
++        height: height.into(),
++        array_length: 1,
++        sample_count: 1,
++        usage: TextureUsage::RENDER_TARGET,
++        resource_options: ResourceOptions::private(),
++        ..TextureDescriptor::default()
++    };
++    let plan = ImagePlan {
++        pixel_format,
++        flags: ImageCreateFlags::empty(),
++        image_type: ImageType::TYPE_2D,
++        format,
++        extent: [width, height, 1],
++        levels: 1,
++        layers: 1,
++        samples: sample_count(1).ok_or_else(|| internal("one sample, which Vulkan names"))?,
++        usage: ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
++        view_formats: Vec::new(),
++        mapping,
++        unavailable: TextureUsage::SHADER_READ
++            | TextureUsage::SHADER_WRITE
++            | TextureUsage::SHADER_ATOMIC
++            | TextureUsage::PIXEL_FORMAT_VIEW,
++    };
++    // Made with no lock held; the pool may keep one another thread made meanwhile beside it.
++    let texture = Device::new_planned_texture(maker, &descriptor, plan)?;
++    let made = Target {
++        texture,
++        level: 0,
++        layer: 0,
++        layers: 1,
++        format,
++        samples: 1,
++        extent,
++    };
++    device.shared().counts.pooled_backing_made();
++    let mut pool = lock(queue.memoryless_backings());
++    pool.takes += 1;
++    let takes = pool.takes;
++    pool.kept.push(PooledBacking {
++        pixel_format,
++        format,
++        samples: 1,
++        layers: 1,
++        extent,
++        bytes: made.texture.placed_bytes().unwrap_or(0),
++        taken: takes,
++        backing: made.clone(),
++    });
++    pool.bound();
++    Ok(made)
++}
++
++/// The Metal pixel format of an opaque-draw prepass's depth ([`prepass_depth`]): 16 bits, which
++/// every Vulkan device takes as a depth attachment, for at most 65534 draws a pass
++/// (`render/opaque_prepass.rs`).
++pub(super) const PREPASS_DEPTH_FORMAT: PixelFormat = PixelFormat::Depth16Unorm;
++
+ /// The clear of a pass's hidden depth and stencil (`hidden`) to Metal's 1.0 and 0, every layer of
+ /// its image, recorded before the pass: each of the pass's instances loads it.
+ pub(super) struct HiddenClear {
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/predicted.rs b/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
+index f15d951a..88de47bc 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/predicted.rs
+@@ -45,6 +45,8 @@
+ //! - **The pass** of the descriptor's attachments: each color's and the depth and stencil's
+ //!   format as an attachment of its pixel format, its raster sample count, no resolve, and the
+ //!   colors the pipeline reads through storage left out of the subpass (`framebuffer_fetch.rs`).
++//!   A descriptor of colors alone at one sample predicts the depth of its pass's opaque-draw
++//!   prepass too (`render/opaque_prepass.rs`).
+ //! - **The input assembly** of the descriptor's topology class (a list; a triangle list when
+ //!   unspecified), and **the fixed state** of Metal's default encoder state.
+ //!
+@@ -84,6 +86,7 @@ use super::BufferForms;
+ use crate::color_list::ColorList;
+ use crate::fetch_reach::format_bytes;
+ use crate::framebuffer_fetch;
++use crate::render::opaque_prepass;
+ use crate::render_state::EncoderState;
+ use crate::render_target::{self, PassShape};
+ use ash::vk;
+@@ -102,24 +105,47 @@ impl GraphicsState {
+     /// Make the `VkPipeline` of the key the state's first draw is predicted to take (the module
+     /// docs), now; a key whose pass is refused is left to its draw.
+     pub(crate) fn make_at_creation(&self) {
+-        let Some((variant, key)) = self.predicted() else {
++        let Some((variant, key, prepass)) = self.predicted() else {
+             return;
+         };
+         let Ok(pass) = render_target::compatible_pass(self.device(), &key.pass) else {
+             return;
+         };
+-        RenderVariant::make_at_creation(vec![(variant, key, pass)], self);
++        let mut makings = vec![(Arc::clone(&variant), key, pass)];
++        // The prepass's `VkPipeline` of a draw that hides what it covers, where the pass a first
++        // draw takes renders the prepass (`render/opaque_prepass.rs`).
++        if let Some(prepass) = prepass {
++            if let Ok(pass) = render_target::compatible_pass(self.device(), &prepass.pass) {
++                makings.push((variant, prepass, pass));
++            }
++        }
++        RenderVariant::make_at_creation(makings, self);
+     }
+ 
+     /// The key of the predicted first draw (the module docs), where the state alone describes
+     /// it, with the variant it runs on.
+-    fn predicted(&self) -> Option<(Arc<RenderVariant>, GraphicsKey)> {
++    /// And the key of its recording into the pass's opaque-draw prepass, where the pass has one
++    /// and every draw of the state hides what it covers.
++    fn predicted(&self) -> Option<(Arc<RenderVariant>, GraphicsKey, Option<GraphicsKey>)> {
+         let StateDescriptor::Vertex(descriptor) = self.descriptor() else {
+             return None;
+         };
+         let (variant, plan) = self.predicted_plan(descriptor)?;
+-        let key = self.predicted_key(descriptor, &variant, &plan)?;
+-        Some((variant, key))
++        let (key, fixed) = self.predicted_key(descriptor, &variant, &plan)?;
++        let graphics = &variant.pipeline().graphics;
++        let prepass = (key.pass.depth_stencil.is_some()
++            && [descriptor.depth_format, descriptor.stencil_format]
++                .iter()
++                .all(|pf| pf.is_none_or(|pf| pf == PixelFormat::Invalid))
++            && opaque_prepass::occludes_alone(graphics))
++        .then(|| GraphicsKey {
++            fixed: FixedState::without_dynamic(
++                opaque_prepass::prepass_fixed(fixed),
++                &graphics.dynamic_states,
++            ),
++            ..key.clone()
++        });
++        Some((variant, key, prepass))
+     }
+ 
+     /// The plan of the predicted first draw: [`with_default_samplers`]'s, where it plans; else
+@@ -158,7 +184,7 @@ impl GraphicsState {
+         descriptor: &RenderPipelineDescriptor,
+         variant: &Arc<RenderVariant>,
+         plan: &BindingPlan,
+-    ) -> Option<GraphicsKey> {
++    ) -> Option<(GraphicsKey, FixedState)> {
+         let pipeline = variant.pipeline();
+         let graphics = &pipeline.graphics;
+         if graphics.writes_depth {
+@@ -198,6 +224,20 @@ impl GraphicsState {
+         };
+         let fetch_inputs =
+             colors.iter().any(Option::is_some) && framebuffer_fetch::through_inputs(profile);
++        // A pass of colors alone of one sample renders its opaque draws' prepass into a depth of
++        // its own (`render/opaque_prepass.rs`): the pass a first draw takes has it, its draws the
++        // depth test the prepass's draws take where they may be hidden.
++        let prepass = depth_stencil.is_none()
++            && colors.iter().any(Option::is_some)
++            && descriptor.raster_sample_count == 1
++            && !fetch_inputs;
++        let depth_stencil = match prepass {
++            true => Some(attachment(
++                crate::attachment_stand_in::PREPASS_DEPTH_FORMAT,
++                FormatUsage::DepthStencilAttachment,
++            )?),
++            false => depth_stencil,
++        };
+         let mut storage = Vec::new();
+         if !fetch_inputs {
+             for s in &graphics.storage_attachments {
+@@ -271,6 +311,11 @@ impl GraphicsState {
+                 profile,
+             )
+             .ok()?;
++        if prepass && !graphics.fragment_writes_memory {
++            fixed.depth_stencil.depth_test_enable = true;
++            fixed.depth_stencil.depth_write_enable = false;
++            fixed.depth_stencil.depth_compare_op = metal2vulkan::vk::CompareOp::LESS_OR_EQUAL;
++        }
+         // A shader-side stencil's draws test the stencil in the function (`draw_fixed`).
+         if graphics.shadow_stencil.is_some() {
+             fixed.depth_stencil.stencil_test_enable = false;
+@@ -289,7 +334,7 @@ impl GraphicsState {
+             fixed: FixedState::without_dynamic(fixed, &graphics.dynamic_states),
+             sample_positions: Vec::new(),
+         };
+-        Some(key)
++        Some((key, fixed))
+     }
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 8495e82f..5d1bfc10 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -398,6 +398,7 @@ mod late_resolve;
+ mod lowering_worker;
+ mod mesh;
+ mod mesh_arguments;
++pub(crate) mod opaque_prepass;
+ mod pass_start_reads;
+ mod pass_steps;
+ mod pending;
+@@ -1104,6 +1105,12 @@ struct Instance {
+     /// What the draws recorded into `draws` bound there that still holds (`render/bound.rs`): a
+     /// draw leaves out a state command that sets what it holds.
+     bound: Bound,
++    /// The secondary command buffer of its opaque draws' prepass, against `compatible`, which its
++    /// subpass runs before every other piece (`render/opaque_prepass.rs`): null until its first
++    /// draw that hides what it covers records.
++    prepass: vk::CommandBuffer,
++    /// What the prepass's draws bound there that still holds.
++    prepass_bound: Bound,
+     /// The pixels its draws may write, as the encoder's `drawn` holds the pass's: within the
+     /// pass's, which bounds them only where it bounds the pass's (`render/shadows.rs`).
+     drawn: clear_reach::DrawnArea,
+@@ -1444,6 +1451,8 @@ pub(crate) struct RenderLowering {
+     /// colors out of its subpass (`render/reroute.rs`): a draw that would record elsewhere, or
+     /// whose variant the interlocked storage form refuses, fails the reroute.
+     rerouting: bool,
++    /// The pass's opaque-draw prepass, as its draws take their depths (`render/opaque_prepass.rs`).
++    prepass: opaque_prepass::Prepass,
+     /// The buffer forms its draws' variants take (`BufferForms`): the large-buffer form where it
+     /// records an execution's commands at its host step, or settles their variants at commit
+     /// (`render/executions.rs`), so no buffer a command binds asks for another variant; the
+@@ -1779,6 +1788,13 @@ impl CommandBuffer {
+             None => (full, None, descriptor),
+         };
+         let rate_map = RateMappedPass::of(CALL, descriptor, &layout, screen)?;
++        let extended = ExtendedShadows::of(descriptor, &layout, rate_map.is_some());
++        // A pass of colors alone renders its opaque draws' prepass into a depth of its own, its
++        // shape's from its first instance on (`render/opaque_prepass.rs`).
++        if opaque_prepass::admits(&layout, rate_map.is_some(), grouping.is_some(), &extended) {
++            let depth = attachment_stand_in::prepass_depth(self, &layout)?;
++            layout.depth_stencil = Some(opaque_prepass::target(depth));
++        }
+         let shape = PassShape::of(&layout)?;
+         let compatible = render_target::shared_compatible_pass(device, &shape)?;
+         if again.is_none() {
+@@ -1790,7 +1806,6 @@ impl CommandBuffer {
+         // an ended encoder's calls again, nor in a pass of several color groups, whose later
+         // groups record after the first group's pass: its draws' secondary begins only where a
+         // command records into it (`RenderCommandEncoder::begin_current_draws`).
+-        let extended = ExtendedShadows::of(descriptor, &layout, rate_map.is_some());
+         let opens = match again.is_none() && groups == 1 {
+             true => inline_first::opens_inline(device, &layout, rate_map.is_some(), &extended),
+             false => Err(NotInline::Encoders),
+@@ -1934,6 +1949,9 @@ impl RenderLowering {
+             grouped,
+         } = opening;
+         let rerecord = extended.keeps_draws();
++        let prepass = opaque_prepass::Prepass::of(
++            (layout.depth_stencil.as_ref()).is_some_and(|ds| ds.prepass),
++        );
+         // The bind state the device's last ended render encoder left (`live_bind.rs`).
+         let live = core.device().shared().live_binds.take();
+         // The views and sampler descriptions its binds made or found (`binding::BindMemo`).
+@@ -1962,6 +1980,8 @@ impl RenderLowering {
+                 positioned: None,
+                 rerecord: rerecord.then(Vec::new),
+                 bound: Bound::default(),
++                prepass: vk::CommandBuffer::null(),
++                prepass_bound: Bound::default(),
+                 drawn: clear_reach::DrawnArea::default(),
+                 inline: false,
+                 continues: false,
+@@ -2042,6 +2062,7 @@ impl RenderLowering {
+             bind_memo,
+             shape_memo: ShapeMemo::default(),
+             last_retained: LastRetained::default(),
++            prepass,
+             heaps_noted: None,
+             inline: match inline {
+                 Some(splits) => inline_first::Inline::Open { splits },
+@@ -4023,6 +4044,13 @@ impl RenderLowering {
+         core.device().shared().live_binds.give(live);
+         earlier.push(current);
+         let mut instances = earlier;
++        // Each instance's opaque-draw prepass runs first in its subpass
++        // (`render/opaque_prepass.rs`), ended with its other secondaries below.
++        for instance in &mut instances {
++            if instance.prepass != vk::CommandBuffer::null() {
++                instance.pieces.insert(0, Piece::Draws(instance.prepass));
++            }
++        }
+         // The first instance's render pass and framebuffer, where it recorded inline in the
+         // command buffer the encoder holds for the pass (`render/inline_first.rs`), and the
+         // instances' after a split that recorded inline there too (`render/inline_splits.rs`):
+@@ -4784,10 +4812,11 @@ impl RenderLowering {
+         // (`fragment_imageblock.rs`).
+         let imageblock_clear = imageblock.as_ref().map(PassImageblock::clear).transpose()?;
+         // The hidden depth and stencil's clear to Metal's 1.0 and 0, which every instance loads.
++        // The prepass's depth clears as its first instance begins (`render/opaque_prepass.rs`).
+         let hidden_clear = layout
+             .depth_stencil
+             .as_ref()
+-            .filter(|ds| ds.hidden)
++            .filter(|ds| ds.hidden && !ds.prepass)
+             .map(|ds| HiddenClear::plan(&ds.target))
+             .transpose()?;
+         // A single-sampled attachment's resolve: its texels, from the image the pass rendered
+@@ -6160,6 +6189,8 @@ impl RenderLowering {
+             // And in a pass that may hold an extended-range color's shadow, on every device.
+             rerecord: self.extended.keeps_draws().then(Vec::new),
+             bound: Bound::default(),
++            prepass: vk::CommandBuffer::null(),
++            prepass_bound: Bound::default(),
+             drawn: clear_reach::DrawnArea::default(),
+             inline: false,
+             continues: false,
+@@ -6274,6 +6305,8 @@ impl RenderLowering {
+             positioned: None,
+             rerecord: None,
+             bound: Bound::default(),
++            prepass: vk::CommandBuffer::null(),
++            prepass_bound: Bound::default(),
+             drawn: clear_reach::DrawnArea::default(),
+             inline: false,
+             continues: false,
+@@ -6365,12 +6398,13 @@ impl RenderLowering {
+     /// it ([`install`](Self::install), `render/reroute.rs`): never submitted,
+     /// a deferred one is never replayed, and one of the pool's ends so the pool goes back to the
+     /// device's spares unreset (`CommandBuffer::give_up_raw`). One with pieces (the secondaries
+-    /// of draws whose pipelines were being made) is left to the pool's reset; one whose secondary
+-    /// never began has none to give up.
++    /// of draws whose pipelines were being made) or a prepass (`render/opaque_prepass.rs`) is left
++    /// to the pool's reset; one whose secondary never began has none to give up.
+     fn end_unrun(&self, instance: Instance) {
+         // Nor one recorded inline, in the pass's command buffer or kept (`render/inline_first.rs`,
+         // `render/inline_splits.rs`).
+         if !instance.pieces.is_empty()
++            || instance.prepass != vk::CommandBuffer::null()
+             || instance.draws == vk::CommandBuffer::null()
+             || instance.inline
+         {
+@@ -8324,7 +8358,7 @@ impl RenderLowering {
+         let kept_state = shape_token.and_then(|token| self.shape_memo.state(token, &variant));
+         let reused_state = kept_state.is_some();
+         let ShapedState {
+-            state: draw_state,
++            state: mut draw_state,
+             viewports,
+             depth,
+         } = match kept_state {
+@@ -8348,6 +8382,42 @@ impl RenderLowering {
+                 shaped
+             }
+         };
++        // The draw's place in the pass's opaque-draw prepass (`render/opaque_prepass.rs`): its
++        // depth, through its viewports' collapsed range, and its depth test; a draw whose compare
++        // fails every fragment keeps its own.
++        let mut role = opaque_prepass::Role::Untested;
++        if self.prepass.on && failing.is_none() {
++            // A bias of zero factors moves no depth; a compensated depth replaces the range.
++            let biased = depth.is_some()
++                || match settings.bias {
++                    None => false,
++                    Some(DepthBiasEffect::Factors {
++                        constant, slope, ..
++                    }) => constant != 0.0 || slope != 0.0,
++                    Some(_) => true,
++                };
++            let counts = self.visibility.counting();
++            role = opaque_prepass::role(graphics, &self.layout, &settings.routing, counts, biased);
++            let at = match role {
++                opaque_prepass::Role::Untested => None,
++                _ => self.prepass.next_depth(),
++            };
++            if at.is_none() {
++                role = opaque_prepass::Role::Untested;
++            }
++            let ds = &mut draw_state.fixed.depth_stencil;
++            ds.depth_test_enable = at.is_some();
++            ds.depth_write_enable = false;
++            ds.depth_compare_op = match at {
++                Some(_) => metal2vulkan::vk::CompareOp::LESS_OR_EQUAL,
++                None => metal2vulkan::vk::CompareOp::ALWAYS,
++            };
++            if let Some(at) = at {
++                for viewport in draw_state.viewports.iter_mut() {
++                    (viewport.min_depth, viewport.max_depth) = (at, at);
++                }
++            }
++        }
+         let fixed = draw_state.fixed;
+         // A rate-mapped pass records the draw once per region of the map's layer of the slice
+         // it renders (`rate_mapped_pass.rs`): each amplification drawn one at a time its own
+@@ -8586,6 +8656,31 @@ impl RenderLowering {
+                 draw_pipeline
+             }
+         };
++        // A draw that hides what it covers records into the prepass too: its colors masked, the
++        // depth tested `LESS` and written (`render/opaque_prepass.rs`). That `VkPipeline`, found
++        // or made now, where the draw's own is made.
++        let prepass_made = match (role, &draw_pipeline) {
++            (opaque_prepass::Role::Occludes, DrawPipeline::Made(_)) => {
++                let prepass_fixed = opaque_prepass::prepass_fixed(fixed);
++                let key = DrawKey {
++                    fixed: FixedState::without_dynamic(prepass_fixed, &graphics.dynamic_states),
++                    ..draw_key()
++                };
++                // Begun on the device's pool where it is not made: the draw records no prepass
++                // then, which hides nothing, and a later draw takes it made.
++                let begun = variant.begin_graphics_pipeline(
++                    &device,
++                    &key,
++                    &compatible,
++                    (&pipeline, &formats),
++                );
++                match begun {
++                    (DrawPipeline::Made(made), _) => Some((made, prepass_fixed)),
++                    (DrawPipeline::Making(_), _) => None,
++                }
++            }
++            _ => None,
++        };
+         if reused_state && reused_pipeline {
+             device.shared().counts.draw_shape_reused();
+         }
+@@ -9399,6 +9494,40 @@ impl RenderLowering {
+                     None => (&pushes[a][..], vk_draws),
+                 }
+             };
++            // The draw's recording into its instance's prepass: where it records now into an
++            // instance of its own secondary, once, with no snapshot pair (the module docs of
++            // `render/opaque_prepass.rs`).
++            let prepass_here = prepass_made.is_some()
++                && made_now.is_some()
++                && pair_base.is_none()
++                && entries == 1
++                && matches!(draw_states, DrawStates::Whole(_))
++                && self.current.kept.is_none()
++                && !self.current.inline
++                && self.replayed.is_none()
++                && !self.rerouting;
++            eprintln!(
++                "DBG role {role:?} here {} made {} now {:?} pipe {:?} dyn {}",
++                prepass_here,
++                prepass_made.is_some(),
++                made_now,
++                prepass_made.as_ref().map(|m| m.0.raw),
++                dynamic.len()
++            );
++            let prepass_state = match (&prepass_made, prepass_here) {
++                (Some((made, prepass_fixed)), true) => {
++                    if self.current.prepass == vk::CommandBuffer::null() {
++                        let compatible = Arc::clone(&self.current.compatible);
++                        self.current.prepass =
++                            self.core.command_buffer().begin_draws(&compatible)?;
++                    }
++                    self.prepass.retain(&mut self.core, made);
++                    let mut state = draw_states.of(0)[0].clone();
++                    state.fixed = *prepass_fixed;
++                    Some((made.raw, state))
++                }
++                _ => None,
++            };
+             for &phase in phases {
+                 let mut first = true;
+                 // Amplification by amplification, each through its recordings' regions: Metal
+@@ -9482,6 +9611,23 @@ impl RenderLowering {
+                                             replayed.record(&recording, bound, &replay_holes)
+                                         },
+                                         None => unsafe { recording.record(bound) },
++                                    };
++                                    if let Some((raw, state)) = &prepass_state {
++                                        let prepass = Recording {
++                                            command_buffer: self.current.prepass,
++                                            pipeline: *raw,
++                                            state,
++                                            pair: None,
++                                            ..recording
++                                        };
++                                        // SAFETY: as for the draw: the prepass is a secondary
++                                        // command buffer recording inside the instance's
++                                        // compatible pass, only this encoder records it, its
++                                        // pipeline is retained (`Prepass::retain`), and its
++                                        // record is of what the prepass's draws bound there.
++                                        let bound = &mut self.current.prepass_bound;
++                                        states_recorded += unsafe { prepass.record(bound) };
++                                        device.shared().counts.opaque_prepass_draw();
+                                     }
+                                 }
+                                 (None, _) => owned.push(recording.owned()),
+diff --git a/crates/metal2vulkan-runtime/src/render/color_groups.rs b/crates/metal2vulkan-runtime/src/render/color_groups.rs
+index 964ccc32..adbb8ded 100644
+--- a/crates/metal2vulkan-runtime/src/render/color_groups.rs
++++ b/crates/metal2vulkan-runtime/src/render/color_groups.rs
+@@ -408,6 +408,7 @@ fn twin(
+         depth_resolve_target: None,
+         stencil_resolve_target: None,
+         hidden: false,
++        prepass: false,
+         ..ds.clone()
+     })
+ }
+diff --git a/crates/metal2vulkan-runtime/src/render/executions.rs b/crates/metal2vulkan-runtime/src/render/executions.rs
+index 6eb8b140..88de1579 100644
+--- a/crates/metal2vulkan-runtime/src/render/executions.rs
++++ b/crates/metal2vulkan-runtime/src/render/executions.rs
+@@ -2344,6 +2344,8 @@ impl RenderExecution {
+                 positioned: None,
+                 rerecord: None,
+                 bound: Bound::default(),
++                prepass: vk::CommandBuffer::null(),
++                prepass_bound: Bound::default(),
+                 drawn: crate::clear_reach::DrawnArea::default(),
+                 inline: false,
+                 continues: false,
+@@ -2399,6 +2401,8 @@ impl RenderExecution {
+             replaying: true,
+             executing_encoder: Some(self.encoder),
+             rerouting: false,
++            // An execution's replay records no prepass: its draws test no depth (`render/opaque_prepass.rs`).
++            prepass: super::opaque_prepass::Prepass::default(),
+             forms,
+             replayed: None,
+             drawn_before: snapshot.drawn.clone(),
+diff --git a/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
+new file mode 100644
+index 00000000..f2d7e4a1
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/render/opaque_prepass.rs
+@@ -0,0 +1,207 @@
++//! The depth prepass of a pass's opaque draws: hidden-surface removal for a pass without a depth
++//! attachment.
++//!
++//! - **Why.** Apple's GPUs shade a pixel of a pass once per visible fragment: a fragment an
++//!   opaque fragment drawn later covers is never shaded. A Vulkan device shades every fragment a
++//!   draw rasterizes, in order, so a pass that stacks layers, opaque ones over earlier ones,
++//!   shades each covered pixel again for every layer. The render server of a tablet's
++//!   compositor draws most of its full-screen passes so: at least 44 % of the samples it shaded
++//!   (a trace of an Adreno 810's passes, 8.4 G samples) lay under a later opaque draw that
++//!   covered the whole pass.
++//! - **How.** Such a pass renders with a depth attachment of its own, which Metal does not see
++//!   (`attachment_stand_in::prepass_depth`, [`DepthStencilTarget::prepass`]): cleared to 1.0 as
++//!   the pass begins, never stored. Each draw takes the depth of its place in the pass, a code of
++//!   that 16-bit depth nearer than every earlier draw's ([`Prepass::next_depth`]), through its
++//!   viewports' collapsed depth range, which leaves its rasterization alone. Each draw that hides
++//!   what it covers ([`Role::Occludes`]) records twice: once into the instance's prepass, a
++//!   secondary command buffer every instance's subpass runs before its draws, with its colors
++//!   masked, the depth test `LESS` and depth writes; and once among the instance's draws, as
++//!   every draw records, with the depth test `LESS_OR_EQUAL` and no depth write. After the
++//!   prepass each pixel holds the depth of the last opaque draw that covers it, so in the draws a
++//!   fragment passes only where no later opaque draw covers it: what Metal shows, each covered
++//!   fragment unshaded. A draw that may not be hidden ([`Role::Untested`]) draws with the depth
++//!   test off, as before.
++//! - **Which passes.** A pass of colors only, one sample, one layer, no visibility buffer, custom
++//!   sample positions, rasterization-rate map, framebuffer fetch, tile memory, color groups or
++//!   extended-range shadows that keep its draws ([`admits`]). Its first instance records in a
++//!   secondary command buffer, as any pass with a depth attachment (`inline_first.rs`).
++//! - **Which draws.** One hides what it covers where it is opaque over every color whose texels
++//!   outlive the pass (no blending, every channel written), its fragment function writes no
++//!   depth and no memory (it runs again in the prepass), and it draws in the plain way (no
++//!   tessellation, mesh, imageblock, fetch, amplification or rerouted colors, no depth bias or
++//!   compensated depth). One may be hidden where its fragment function writes no memory and no
++//!   depth and no visibility result counts its samples. A draw recorded later, once its pipeline
++//!   is made (`render/pending.rs`), or into an instance recorded inline after a split
++//!   (`render/inline_splits.rs`), or for an execution or a replay, records no prepass: it hides
++//!   nothing, which is never wrong.
++//! - **The bound.** A pass of more draws than the depth's codes ([`MOST_DRAWS`]) draws the rest
++//!   with the depth test off.
++
++use super::extended_shadow::ExtendedShadows;
++use crate::color_reformat::Routing;
++use crate::encoder::EncoderCore;
++use crate::pipeline::FixedState;
++use crate::pipeline::RawPipeline;
++use crate::render_pass::{DepthStencilTarget, PassLayout, Target};
++use crate::render_values::StoreAction;
++use metal2vulkan::pipeline::{ColorAttachmentState, GraphicsState};
++use metal2vulkan::vk::ColorComponentFlags;
++use std::sync::Arc;
++
++/// The draws of a pass that take a depth of their own: the 16-bit depth's codes below 1.0 but
++/// one (its first draw's code is the largest).
++pub(super) const MOST_DRAWS: u32 = 65534;
++
++/// Whether a pass of `layout` renders its opaque draws' prepass (the module docs).
++pub(super) fn admits(
++    layout: &PassLayout,
++    rate_mapped: bool,
++    grouped: bool,
++    extended: &ExtendedShadows,
++) -> bool {
++    layout.depth_stencil.is_none()
++        && layout.colors.iter().flatten().next().is_some()
++        && layout.samples == 1
++        && layout.layers <= 1
++        && layout.visibility.is_none()
++        && layout.sample_positions.is_empty()
++        && !layout.fetch_inputs
++        && layout.tile.threadgroup_memory_length == 0
++        && layout.tile.sample_length == 0
++        && layout.fails_command_buffer.is_none()
++        && !rate_mapped
++        && !grouped
++        && !extended.keeps_draws()
++}
++
++/// A pass's prepass, as its draws take their depths.
++#[derive(Default)]
++pub(super) struct Prepass {
++    /// The pass renders it ([`admits`]).
++    pub(super) on: bool,
++    /// The draws that took a depth so far.
++    draws: u32,
++    /// The prepass `VkPipeline` its last draw retained ([`retain`](Prepass::retain)).
++    retained: Option<Arc<RawPipeline>>,
++}
++
++impl Prepass {
++    /// The prepass of a pass that `on` admits.
++    pub(super) fn of(on: bool) -> Prepass {
++        Prepass {
++            on,
++            draws: 0,
++            retained: None,
++        }
++    }
++
++    /// Retain into `core` the prepass `VkPipeline` a draw records, unless the draw before took
++    /// the same one: held until the command buffer completes, as the draws' own are.
++    pub(super) fn retain(&mut self, core: &mut EncoderCore, made: &Arc<RawPipeline>) {
++        if !self.retained.as_ref().is_some_and(|r| Arc::ptr_eq(r, made)) {
++            core.retain_shared(made.clone());
++            self.retained = Some(Arc::clone(made));
++        }
++    }
++
++    /// The depth of the pass's next draw, nearer than every earlier draw's: `None` past
++    /// [`MOST_DRAWS`], or where the pass renders no prepass.
++    pub(super) fn next_depth(&mut self) -> Option<f32> {
++        if !self.on || self.draws >= MOST_DRAWS {
++            return None;
++        }
++        self.draws += 1;
++        Some((65535 - self.draws) as f32 / 65535.0)
++    }
++}
++
++/// What a draw is to its pass's prepass (the module docs).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Role {
++    /// It hides what it covers: it records into the prepass too.
++    Occludes,
++    /// It may be hidden: it tests the prepass's depth.
++    Tested,
++    /// It draws as without a prepass: no depth test.
++    Untested,
++}
++
++/// What a draw of `graphics` is to its pass of `layout`, its colors routed by `routing`, where a
++/// visibility result `counts` its samples and its depth is `biased` or compensated (the module
++/// docs).
++pub(super) fn role(
++    graphics: &GraphicsState,
++    layout: &PassLayout,
++    routing: &Routing,
++    counts: bool,
++    biased: bool,
++) -> Role {
++    let g = graphics;
++    let plain = plain(g) && routing.locations.is_empty() && !counts && !biased;
++    if !plain {
++        return Role::Untested;
++    }
++    let opaque = layout.colors.iter().enumerate().all(|(index, color)| {
++        let Some(color) = color else { return true };
++        // A color whose texels end with the pass, which no draw reads in it.
++        let ends = color.store == StoreAction::DontCare
++            && !color.late_store
++            && color.resolve.is_none()
++            && color.copied_resolve.is_none();
++        let written = g.color_attachments.get(index).and_then(Option::as_ref);
++        ends || written.is_some_and(opaque)
++    });
++    match opaque {
++        true => Role::Occludes,
++        false => Role::Tested,
++    }
++}
++
++/// Whether a draw of `g` may hide what it covers, or be hidden, as far as its pipeline alone
++/// says (the module docs): its fragment function writes no depth and no memory, and it draws in
++/// the plain way.
++fn plain(g: &GraphicsState) -> bool {
++    !g.writes_depth
++        && !g.fragment_writes_memory
++        && !g.rasterizer_discard
++        && g.tessellation.is_none()
++        && g.emulated_tessellation.is_none()
++        && g.mesh_records.is_none()
++        && g.fragment_imageblock.is_none()
++        && g.input_attachments.is_empty()
++        && g.max_vertex_amplification_count <= 1
++}
++
++/// Whether a color state writes every channel of its attachment, unblended.
++fn opaque(c: &ColorAttachmentState) -> bool {
++    let all = ColorComponentFlags::R
++        | ColorComponentFlags::G
++        | ColorComponentFlags::B
++        | ColorComponentFlags::A;
++    c.blend.is_none() && c.write_mask.contains(all)
++}
++
++/// Whether every draw of `g` in a pass whose colors are all its own hides what it covers, as its
++/// pipeline alone says: what a state's creation makes the prepass's `VkPipeline` for
++/// (`pipeline/predicted.rs`).
++pub(crate) fn occludes_alone(g: &GraphicsState) -> bool {
++    plain(g)
++        && g.color_attachments.iter().any(Option::is_some)
++        && g.color_attachments.iter().flatten().all(opaque)
++}
++
++/// `fixed`, a draw's fixed state, as the prepass records the draw: its colors masked, the depth
++/// tested `LESS` and written.
++pub(crate) fn prepass_fixed(mut fixed: FixedState) -> FixedState {
++    fixed.masks_color = true;
++    let ds = &mut fixed.depth_stencil;
++    ds.depth_test_enable = true;
++    ds.depth_write_enable = true;
++    ds.depth_compare_op = metal2vulkan::vk::CompareOp::LESS;
++    fixed
++}
++
++/// The prepass's depth target of a pass, from its image (`attachment_stand_in::prepass_depth`).
++pub(super) fn target(image: Target) -> DepthStencilTarget {
++    DepthStencilTarget::prepass(image)
++}
+diff --git a/crates/metal2vulkan-runtime/src/render_pass.rs b/crates/metal2vulkan-runtime/src/render_pass.rs
+index 210b283b..f4a2ebe4 100644
+--- a/crates/metal2vulkan-runtime/src/render_pass.rs
++++ b/crates/metal2vulkan-runtime/src/render_pass.rs
+@@ -912,8 +912,11 @@ pub(super) struct DepthStencilTarget {
+     pub(super) depth_filter: MultisampleDepthResolveFilter,
+     pub(super) stencil_filter: MultisampleStencilResolveFilter,
+     /// `target` is the pass's hidden depth and stencil (`DepthStencilTarget::hidden`): Metal's
+-    /// pass has no depth/stencil attachment, and a draw's state uses one.
++    /// pass has no depth/stencil attachment, and a draw's state uses one. Set too for the depth
++    /// of the pass's opaque-draw prepass (`prepass`), which Metal does not see either.
+     pub(super) hidden: bool,
++    /// `target` is the depth of the pass's opaque-draw prepass (`DepthStencilTarget::prepass`).
++    pub(super) prepass: bool,
+ }
+ 
+ impl DepthStencilTarget {
+@@ -948,6 +951,30 @@ impl DepthStencilTarget {
+             depth_filter: MultisampleDepthResolveFilter::default(),
+             stencil_filter: MultisampleStencilResolveFilter::default(),
+             hidden: true,
++            prepass: false,
++        }
++    }
++
++    /// The depth of the opaque-draw prepass of a pass without a depth/stencil attachment,
++    /// rendered into `target` (`attachment_stand_in::prepass_depth`, `render/opaque_prepass.rs`):
++    /// a depth Metal does not see, cleared to 1.0 as the pass's first instance begins, kept
++    /// between its instances and stored by none past the last. It names no Metal depth format,
++    /// so no draw's depth bias follows it.
++    pub(super) fn prepass(target: Target) -> DepthStencilTarget {
++        DepthStencilTarget {
++            depth: Some(AspectTarget {
++                load: LoadAction::Clear,
++                store: StoreAction::DontCare,
++                late_store: false,
++                options: StoreActionOptions::NONE,
++                memoryless: false,
++                clear: AspectClear::Depth(1.0),
++                written_nan: false,
++            }),
++            stencil: None,
++            depth_format: None,
++            prepass: true,
++            ..DepthStencilTarget::hidden(target)
+         }
+     }
+ }
+@@ -1030,8 +1057,10 @@ impl Clone for PassLayout {
+ impl PassLayout {
+     /// Whether the pass has a depth and a stencil: of its attachments, or the hidden ones a draw
+     /// or an execution gave it.
++    /// The depth of an opaque-draw prepass is none of Metal's (`DepthStencilTarget::prepass`).
+     pub(super) fn aspects(&self) -> (bool, bool) {
+-        self.depth_stencil.as_ref().map_or((false, false), |ds| {
++        let ds = self.depth_stencil.as_ref().filter(|ds| !ds.prepass);
++        ds.map_or((false, false), |ds| {
+             (ds.depth.is_some(), ds.stencil.is_some())
+         })
+     }
+@@ -2321,6 +2350,7 @@ fn depth_stencil(
+         depth_filter: d.depth_resolve_filter,
+         stencil_filter: s.stencil_resolve_filter,
+         hidden: false,
++        prepass: false,
+     }))
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index 9d0706db..644e5416 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -1256,7 +1256,8 @@ fn depth_stencil_ops(
+     at: Position,
+     dont_care: DontCare,
+ ) -> Ops {
+-    let dont_care = dont_care.unless(ds.hidden);
++    // The prepass's depth is handed the driver as Metal's `DontCare` store is.
++    let dont_care = dont_care.unless(ds.hidden && !ds.prepass);
+     let later = later_stored(layout);
+     let stored = |aspect, store| match at.last && later.contains(aspect) {
+         true => vk::AttachmentStoreOp::STORE,
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+index cbeec393..3841c8a6 100644
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -183,6 +183,8 @@ mod neutral_zeros_shared;
+ mod noted_apart;
+ mod numbered_samplers;
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
++mod opaque_prepass;
++#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod optional_extensions;
+ mod options;
+ mod own;
+diff --git a/crates/metal2vulkan-runtime/src/tests/opaque_prepass.rs b/crates/metal2vulkan-runtime/src/tests/opaque_prepass.rs
+new file mode 100644
+index 00000000..4c8f42bf
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/opaque_prepass.rs
+@@ -0,0 +1,230 @@
++//! A pass of colors alone that stacks blended and opaque layers renders its opaque draws' depth
++//! prepass (`render/opaque_prepass.rs`): every opaque draw records into its instance's prepass too
++//! (`WorkCounts::opaque_prepass_draws`), and the target holds what the draws show in order, each
++//! blended layer over what the layers before it left, each opaque one in place of them, as plain
++//! Metal shows them.
++//!
++//! A device test: compiled only under the validation crate's GPU safety cfgs (`m2v_gpu`,
++//! `m2v_cpu_icd`), on the kind of device the cfg selects. The functions are `tob_rect` and
++//! `tob_solid` of the owned fixture `validation/fixtures/public/engine/tob_renders.ll`
++//! (`llvm-as`).
++
++use crate::{
++    BlitOption, Device, DeviceKind, DeviceOptions, LoadAction, Origin, PipelineOptions,
++    RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
++    ShaderCacheOptions, Size, StoreAction, TextureDescriptor,
++};
++use metal2vulkan::metal::{BlendFactor, BlendOperation, PixelFormat, PrimitiveType, TextureUsage};
++use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++
++/// The longest the command buffer may take.
++const WAIT: Duration = Duration::from_secs(60);
++
++/// The target's side, in pixels.
++const SIDE: u64 = 32;
++
++/// A scratch directory for the device's shader cache, removed when dropped.
++struct Scratch(PathBuf);
++
++impl Scratch {
++    fn new() -> Scratch {
++        let name = format!("m2v-opaque-prepass-{}", std::process::id());
++        let path = std::env::temp_dir().join(name);
++        std::fs::create_dir_all(&path).unwrap();
++        Scratch(path)
++    }
++}
++
++impl Drop for Scratch {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
++/// The device the cfg selects: a CPU device under `m2v_cpu_icd`, else a GPU, its shader cache
++/// in `cache`.
++fn device(cache: &Path) -> Device {
++    let options = DeviceOptions {
++        kinds: match cfg!(m2v_cpu_icd) {
++            true => vec![DeviceKind::Cpu],
++            false => vec![
++                DeviceKind::Discrete,
++                DeviceKind::Integrated,
++                DeviceKind::Virtual,
++            ],
++        },
++        shader_cache: ShaderCacheOptions {
++            directory: Some(cache.to_owned()),
++            ..ShaderCacheOptions::default()
++        },
++        ..DeviceOptions::default()
++    };
++    Device::system_default_with(&options).unwrap()
++}
++
++fn floats(v: [f32; 4]) -> Vec<u8> {
++    v.iter().flat_map(|f| f.to_le_bytes()).collect()
++}
++
++/// The corners, in normalized device coordinates, of the target's pixels `[x0, x1) x [y0, y1)`.
++fn corners([x0, y0, x1, y1]: [u64; 4]) -> Vec<u8> {
++    let x = |p: u64| p as f32 / SIDE as f32 * 2.0 - 1.0;
++    let y = |p: u64| 1.0 - p as f32 / SIDE as f32 * 2.0;
++    floats([x(x0), y(y1), x(x1), y(y0)])
++}
++
++/// Fill the box `rect` with `color`, in 255ths.
++fn fill(
++    encoder: &mut RenderCommandEncoder,
++    state: &RenderPipelineState,
++    rect: [u64; 4],
++    color: [u8; 4],
++) {
++    encoder.set_render_pipeline_state(state).unwrap();
++    encoder.set_vertex_bytes(&corners(rect), 0).unwrap();
++    let color = color.map(|c| f32::from(c) / 255.0);
++    encoder.set_fragment_bytes(&floats(color), 0).unwrap();
++    encoder
++        .draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0)
++        .unwrap();
++}
++
++/// The fixture's state of `tob_rect` and `tob_solid`, one `RGBA8Unorm` target, blended
++/// source-over where `blended`.
++fn state(device: &Device, blended: bool) -> RenderPipelineState {
++    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../metal2vulkan-validation/fixtures/public/engine/tob_renders.ll");
++    let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
++    let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
++    let library = device.new_library_with_compile_library(library);
++    let vertex = library.new_function_with_name("tob_rect").unwrap();
++    let fragment = library.new_function_with_name("tob_solid").unwrap();
++    let mut descriptor =
++        RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
++    descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
++    let mut color = ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm);
++    if blended {
++        color.blending_enabled = true;
++        color.source_rgb_blend_factor = BlendFactor::SourceAlpha;
++        color.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
++        color.rgb_blend_operation = BlendOperation::Add;
++        color.source_alpha_blend_factor = BlendFactor::One;
++        color.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
++        color.alpha_blend_operation = BlendOperation::Add;
++    }
++    descriptor.color_attachments[0] = Some(color);
++    device
++        .new_render_pipeline_state(&descriptor, &PipelineOptions::default())
++        .unwrap()
++}
++
++/// The layers, in draw order: the box, its red and alpha in 255ths, and whether it blends.
++const LAYERS: [([u64; 4], u8, u8, bool); 6] = [
++    ([0, 0, 32, 32], 40, 128, true),
++    ([4, 4, 28, 28], 90, 255, false),
++    ([2, 6, 20, 30], 200, 96, true),
++    ([8, 8, 24, 24], 150, 255, false),
++    ([10, 2, 30, 14], 250, 160, true),
++    ([12, 12, 20, 20], 60, 255, false),
++];
++
++/// What the layers leave at pixel `(x, y)`, red then alpha, from `before`: each blended one
++/// source-over, each opaque one in place.
++fn shown(x: u64, y: u64, before: [f32; 2]) -> [f32; 2] {
++    let mut at = before;
++    for ([x0, y0, x1, y1], red, alpha, blended) in LAYERS {
++        if !((x0..x1).contains(&x) && (y0..y1).contains(&y)) {
++            continue;
++        }
++        let (r, a) = (f32::from(red) / 255.0, f32::from(alpha) / 255.0);
++        at = match blended {
++            true => [r * a + at[0] * (1.0 - a), a + at[1] * (1.0 - a)],
++            false => [r, a],
++        };
++    }
++    at
++}
++
++#[test]
++fn opaque_layers_hide_what_they_cover_and_the_target_holds_what_metal_shows() {
++    let scratch = Scratch::new();
++    let device = device(&scratch.0);
++    let queue = device.new_command_queue().unwrap();
++    let (opaque, blended) = (state(&device, false), state(&device, true));
++    let mut d = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
++    d.usage = TextureUsage::RENDER_TARGET;
++    d.resource_options = ResourceOptions::private();
++    let target = device.new_texture(&d).unwrap();
++    let back = device
++        .new_buffer(SIDE * SIDE * 4, ResourceOptions::shared())
++        .unwrap();
++    let mut pass = RenderPassDescriptor::new();
++    let color = &mut pass.color_attachments[0];
++    color.texture = Some(target.clone());
++    color.load_action = LoadAction::Clear;
++    color.store_action = StoreAction::Store;
++    let layers = |encoder: &mut RenderCommandEncoder| {
++        for (rect, red, alpha, blends) in LAYERS {
++            let state = match blends {
++                true => &blended,
++                false => &opaque,
++            };
++            fill(encoder, state, rect, [red, 0, 0, alpha]);
++        }
++    };
++    // A first pass makes the `VkPipeline`s: a draw whose pipeline is being made records later,
++    // without its prepass (`render/pending.rs`).
++    let first = queue.command_buffer().unwrap();
++    let mut encoder = first.render_command_encoder(&pass).unwrap();
++    layers(&mut encoder);
++    encoder.end_encoding().unwrap();
++    first.commit().unwrap();
++    first.wait_until_completed_for(WAIT).unwrap();
++    let counted = device.work_counts();
++    let command_buffer = queue.command_buffer().unwrap();
++    let mut encoder = command_buffer.render_command_encoder(&pass).unwrap();
++    layers(&mut encoder);
++    encoder.end_encoding().unwrap();
++    let mut blit = command_buffer.blit_command_encoder().unwrap();
++    blit.copy_from_texture_to_buffer(
++        &target,
++        0,
++        0,
++        Origin::new(0, 0, 0),
++        Size::new(SIDE, SIDE, 1),
++        &back,
++        0,
++        SIDE * 4,
++        SIDE * SIDE * 4,
++        BlitOption::None,
++    )
++    .unwrap();
++    blit.end_encoding().unwrap();
++    command_buffer.commit().unwrap();
++    command_buffer.wait_until_completed_for(WAIT).unwrap();
++    assert_eq!(command_buffer.error(), None);
++    // The path ran: each of the three opaque layers recorded into the prepass.
++    let after = device.work_counts();
++    assert_eq!(after.opaque_prepass_draws - counted.opaque_prepass_draws, 3);
++    let contents = back.contents().unwrap();
++    // SAFETY: the buffer's bytes, which no command uses now.
++    let bytes = unsafe { std::slice::from_raw_parts(contents.as_ptr(), back.length() as usize) };
++    for y in 0..SIDE {
++        for x in 0..SIDE {
++            // From Metal's default clear color, opaque black.
++            let [red, alpha] = shown(x, y, [0.0, 1.0]);
++            let at = ((y * SIDE + x) * 4) as usize;
++            let close = |got: u8, want: f32| (f32::from(got) - want * 255.0).abs() <= 1.5;
++            assert!(
++                close(bytes[at], red) && close(bytes[at + 3], alpha),
++                "pixel ({x}, {y}): red {} alpha {}, Metal shows {:.1} {:.1}",
++                bytes[at],
++                bytes[at + 3],
++                red * 255.0,
++                alpha * 255.0
++            );
++        }
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 1c56ba2c..c77e192e 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -259,6 +259,7 @@ pub(crate) struct Counters {
+     set_zero_sets_reused: AtomicU64,
+     set_zero_sets_found: AtomicU64,
+     draw_shapes_reused: AtomicU64,
++    opaque_prepass_draws: AtomicU64,
+     dispatches_settled_as_before: AtomicU64,
+     dispatches_planned_as_before: AtomicU64,
+     baked_sampler_dispatches_apart: AtomicU64,
+@@ -1789,6 +1790,12 @@ impl Counters {
+         self.draw_shapes_reused.fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    /// A draw that hides what it covers, recorded into its instance's opaque-draw prepass too
++    /// (`render/opaque_prepass.rs`).
++    pub(crate) fn opaque_prepass_draw(&self) {
++        self.opaque_prepass_draws.fetch_add(1, Ordering::Relaxed);
++    }
++
+     /// A compute encoder's dispatch that took what its last dispatch settled
+     /// (`compute::DispatchMemo`).
+     pub(crate) fn dispatch_settled_as_before(&self) {
+@@ -4147,6 +4154,9 @@ pub struct WorkCounts {
+     /// derivation announces a notice the device announces at every occurrence
+     /// (`DeviceOptions::announce_each`).
+     pub draw_shapes_reused: u64,
++    /// Draws that hide what they cover, recorded into their instance's opaque-draw prepass too
++    /// (`render/opaque_prepass.rs`): each with its colors masked, the depth tested and written.
++    pub opaque_prepass_draws: u64,
+     /// Compute encoders' dispatches that took the bind state, variant, plan, commands and made
+     /// `VkPipeline`s their encoder's last dispatch settled, rather than settling them again:
+     /// those of the same pipeline state, dispatch, table (no call changed it since), threadgroup
+@@ -5327,6 +5337,7 @@ impl Device {
+             set_zero_sets_reused: counters.set_zero_sets_reused.load(Ordering::Relaxed),
+             set_zero_sets_found: counters.set_zero_sets_found.load(Ordering::Relaxed),
+             draw_shapes_reused: counters.draw_shapes_reused.load(Ordering::Relaxed),
++            opaque_prepass_draws: counters.opaque_prepass_draws.load(Ordering::Relaxed),
+             dispatches_settled_as_before: (counters.dispatches_settled_as_before)
+                 .load(Ordering::Relaxed),
+             dispatches_planned_as_before: (counters.dispatches_planned_as_before)
