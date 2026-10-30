@@ -52,10 +52,23 @@ static std::set<std::string> readLines(const std::string &path) {
     }
     return lines;
 }
+// The library list keeps its order: its first libraries are primed first, so the render server's own (QuartzCore) lead it.
+static std::vector<std::string> readList(const std::string &path) {
+    std::vector<std::string> lines;
+    if (FILE *f = fopen(path.c_str(), "r")) {
+        char line[1024];
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\n")] = 0;
+            if (line[0]) lines.push_back(line);
+        }
+        fclose(f);
+    }
+    return lines;
+}
 // The same list carried in this executable's __DATA,__primelist section (build-adreno-metal-plugin.py), for a render server whose sandbox
 // refuses to read the file beside the bundle.
-static std::set<std::string> embeddedLines() {
-    std::set<std::string> lines;
+static std::vector<std::string> embeddedLines() {
+    std::vector<std::string> lines;
     Dl_info info = {};
     if (!dladdr(reinterpret_cast<const void *>(&embeddedLines), &info) || !info.dli_fbase) return lines;
     unsigned long size = 0;
@@ -65,7 +78,7 @@ static std::set<std::string> embeddedLines() {
     for (size_t at = 0; at < text.size();) {
         size_t end = text.find('\n', at);
         if (end == std::string::npos) end = text.size();
-        if (end > at) lines.insert(text.substr(at, end - at));
+        if (end > at) lines.push_back(text.substr(at, end - at));
         at = end + 1;
     }
     return lines;
@@ -88,7 +101,7 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
     std::set<std::pair<dev_t, ino_t>> seen;
     unsigned lines = 0, failed = 0;
     int lastErrno = 0;
-    std::set<std::string> list = listPath.empty() ? std::set<std::string>() : readLines(listPath);
+    std::vector<std::string> list = listPath.empty() ? std::vector<std::string>() : readList(listPath);
     const char *source = listPath.empty() ? "(none)" : listPath.c_str();
     if (list.empty()) {list = embeddedLines(); source = "embedded";}
     for (const std::string &path : list) {

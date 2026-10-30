@@ -173,7 +173,8 @@ static CommitRecord gCommitRing[32];
 // (longer ones are idle). pg = the earlier render buffer's commit-to-callback, enc = this buffer's creation-to-commit, res = what is left
 // (negative when the two overlapped), kpx = the earlier one's thousands of pixels, hv = how many earlier ones were over 30 Mpx.
 // ---- frame trace: one record per command buffer and per wait, appended to a file by a writer thread ----
-// The file is read by the kernel's diagnostic export (BootDiagExport.c lists it), so a hang or a reset still leaves everything up to then.
+// The file (m2v/gpu/frames-<pid>.trace) is read by the kernel's GPU trace export (BootDiagExport.c), so a hang or a reset still leaves
+// everything up to then.
 // 72-byte records: type 1 command buffer {idx, t0 created, t1 committed, t2 scheduled (0: unknown), t3 completion callback, a passes, b draws,
 // c thousands of pixels, d blits, tid creator thread, cpu0/cpu1 its cumulative CPU microseconds at creation and at commit, tid2 committing
 // thread}; type 2 waitUntilCompleted {t0 begin, t1 end, tid, a caller (low 32 bits), cpu0 the thread's CPU time at the start, cpu1 at the end};
@@ -319,7 +320,12 @@ static void traceStartWriter() {
  std::thread([]{
   pthread_setname_np("frame-trace");
   int fd=-1;
-  static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
+  // One file per process, in the GPU trace's directory (sheng-gpu-trace-export copies it every few seconds): each process truncated the one
+  // shared frames.trace when its writer started, so the render server's records were gone by the export (T74: 3 records in 100 s).
+  char mobile[128],root[128];
+  snprintf(mobile,sizeof mobile,"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/gpu/frames-%d.trace",getpid());
+  snprintf(root,sizeof root,"/private/var/root/Library/Caches/com.apple.backboardd/m2v/gpu/frames-%d.trace",getpid());
+  const char *const paths[]={mobile,root};
   uint32_t written=0,sampled=0;int profileFd=-1;
   static const char *const profilePaths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/cpu.profile","/private/var/root/Library/Caches/com.apple.backboardd/m2v/cpu.profile"};
   for(;;) {
