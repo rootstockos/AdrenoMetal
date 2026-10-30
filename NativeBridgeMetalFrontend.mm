@@ -4255,6 +4255,19 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (unsigned long long)(sc[16]>>20),(unsigned long long)(sc[17]>>20),(unsigned long long)(sc[18]>>20),(unsigned long long)(sc[19]>>20),
     (unsigned long long)(sc[20]>>20),(unsigned long long)(sc[21]>>20),(unsigned long long)(sc[22]>>20));
   }
+  // T78 (TU_DW_TRACE h): DP the copies in a dirty-page log would decide (gated, whole, skipped, MiB whole/copied, stamps, waits,
+  // unanswered); DW the watched shadows (sources, watches made/live, MiB watched: private read-only, private writable, shared,
+  // unknown); DH the hashing rounds (rounds, ms, pages hashed, unchanged, changed, first seen; MiB weighted by stamps, of them unchanged).
+  uint64_t dc[28]={};
+  if(nmb_device_dirty_counts(gDevice,dc) && dc[9]) {
+   auto mb=[](uint64_t b){return (unsigned long long)(b>>20);};
+   row("DP g%llu w%llu s%llu MB %llu/%llu st%llu wt%llu/%llu",(unsigned long long)dc[0],(unsigned long long)dc[1],(unsigned long long)dc[2],
+    mb(dc[3]),mb(dc[4]),(unsigned long long)dc[5],(unsigned long long)dc[6],(unsigned long long)dc[7]);
+   row("DW src%llu w%llu/%llu MB %llu ro%llu rw%llu sh%llu ?%llu rq%llu wr%llu",(unsigned long long)dc[9],(unsigned long long)dc[10],
+    (unsigned long long)dc[11],mb(dc[12]),mb(dc[13]),mb(dc[14]),mb(dc[15]),mb(dc[16]),(unsigned long long)dc[17],(unsigned long long)dc[18]);
+   row("DH r%llu %llums pg%llu same%llu chg%llu new%llu wMB %llu same %llu",(unsigned long long)dc[19],ms(dc[20]),(unsigned long long)dc[21],
+    (unsigned long long)dc[22],(unsigned long long)dc[23],(unsigned long long)dc[24],mb(dc[25]),mb(dc[26]));
+  }
   // Where passes cost more than one pass in tile memory: passes begun as instances, split inline; instance splits for a barrier, tile
   // memory, a memoryless write, a pending pipeline; stand-ins made and MiB; stand-in copies, of them at draws.
   uint64_t pc[10]={};

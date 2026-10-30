@@ -866,6 +866,290 @@ pub extern "C" fn nmb_no_copy_remaps(out: *mut u64) -> bool {
     true
 }
 
+// ---- T78: what a dirty-page log would save the copies into host-page shadows (TU_DW_TRACE with h, the render server) ----
+// T76-T77: copies into shadows of host-page textures were a third of the GPU's time in the open/close animations, each moving every
+// byte, since the bridge gives metal2vulkan no DirtyPages. With h, every no-copy object's memory carries DirtyMeasure: it answers every
+// wait false, so the runtime still copies every byte but counts the copies a log would decide (WorkCounts::dirty_*), while a thread of
+// its own hashes the watched pages of the memories commits asked stamps of, at most four rounds a second, and counts the pages unchanged
+// since its last round, weighted by those stamps: a lower bound on what a log would let the copies skip (a page that changed once in a
+// round's 250 ms counts as changed for every copy in it). Each watch also notes how its pages are shared (mach_vm_region_recurse).
+
+/// The measurement's counters, nmb_device_dirty_counts' last 19 words: sources, watches made and live, watched bytes made, and of
+/// them private or copy-on-write read-only, private or copy-on-write writable, shared, unknown; stamps asked, writes reported, rounds,
+/// their microseconds, pages hashed, unchanged, changed and first seen, watched bytes weighted by stamps, of them unchanged; pages kept.
+static DIRTY_COUNTS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
+const DC_SOURCES: usize = 0;
+const DC_WATCHES: usize = 1;
+const DC_WATCHES_LIVE: usize = 2;
+const DC_WATCHED: usize = 3;
+const DC_PRIVATE_RO: usize = 4;
+const DC_REQUESTS: usize = 8;
+const DC_WROTE: usize = 9;
+const DC_ROUNDS: usize = 10;
+const DC_ROUND_US: usize = 11;
+const DC_PAGES: usize = 12;
+const DC_SAME: usize = 13;
+const DC_CHANGED: usize = 14;
+const DC_FIRST: usize = 15;
+const DC_WEIGHTED: usize = 16;
+const DC_WEIGHTED_SAME: usize = 17;
+const DC_KEPT: usize = 18;
+
+fn dirty_count(i: usize, n: u64) {
+    DIRTY_COUNTS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dirty_measuring() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TU_DW_TRACE").is_ok_and(|letters| letters.contains('h')))
+}
+
+/// A watched range's bytes (host addresses), alive until its watch drops; the hashing thread reads them only while it holds `alive`
+/// and finds it true, and the drop clears it under the same lock, so no round reads pages the memory may have freed.
+struct DirtyEntry {
+    memory: u64,
+    start: u64,
+    end: u64,
+    alive: std::sync::Mutex<bool>,
+}
+
+#[derive(Default)]
+struct DirtyShared {
+    watches: std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<DirtyEntry>>>,
+    /// Stamps asked per memory since the last round.
+    asked: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+    wake: std::sync::Mutex<bool>,
+    woken: std::sync::Condvar,
+}
+
+fn dirty_shared() -> &'static DirtyShared {
+    static SHARED: std::sync::OnceLock<DirtyShared> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("native-metal-dirty".into()).spawn(dirty_rounds);
+        DirtyShared::default()
+    })
+}
+
+fn dirty_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct DirtyMeasure {
+    id: u64,
+    base: u64,
+}
+
+impl DirtyMeasure {
+    fn new(base: u64) -> DirtyMeasure {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        dirty_count(DC_SOURCES, 1);
+        DirtyMeasure { id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), base }
+    }
+}
+
+struct DirtyMeasureWatch(u64);
+
+impl Drop for DirtyMeasureWatch {
+    fn drop(&mut self) {
+        let entry = dirty_lock(&dirty_shared().watches).remove(&self.0);
+        if let Some(entry) = entry {
+            *dirty_lock(&entry.alive) = false;
+            DIRTY_COUNTS[DC_WATCHES_LIVE].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl metal2vulkan_runtime::DirtyPages for DirtyMeasure {
+    type Watch = DirtyMeasureWatch;
+
+    fn watch(&self, range: std::ops::Range<u64>) -> DirtyMeasureWatch {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (start, end) = (self.base + range.start, self.base + range.end);
+        dirty_count(DC_WATCHES, 1);
+        dirty_count(DC_WATCHES_LIVE, 1);
+        dirty_count(DC_WATCHED, end - start);
+        dirty_count(DC_PRIVATE_RO + dirty_sharing(start), end - start);
+        let entry = DirtyEntry { memory: self.id, start, end, alive: std::sync::Mutex::new(true) };
+        dirty_lock(&dirty_shared().watches).insert(id, std::sync::Arc::new(entry));
+        DirtyMeasureWatch(id)
+    }
+
+    fn request(&self) -> metal2vulkan_runtime::DirtyStamp {
+        static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let shared = dirty_shared();
+        *dirty_lock(&shared.asked).entry(self.id).or_insert(0) += 1;
+        dirty_count(DC_REQUESTS, 1);
+        *dirty_lock(&shared.wake) = true;
+        shared.woken.notify_one();
+        metal2vulkan_runtime::DirtyStamp(STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
+    }
+
+    /// Never answered: the runtime copies every byte, as without a log.
+    fn wait(&self, _stamp: metal2vulkan_runtime::DirtyStamp) -> bool {
+        false
+    }
+
+    fn changed(&self, _since: metal2vulkan_runtime::DirtyStamp, out: &mut Vec<std::ops::Range<u64>>) {
+        out.push(0..u64::MAX);
+    }
+
+    fn wrote(&self, _range: std::ops::Range<u64>) {
+        dirty_count(DC_WROTE, 1);
+    }
+}
+
+/// How the pages at `address` are shared, as a counter's offset from DC_PRIVATE_RO: 0 private or copy-on-write and not writable here
+/// (no other task's write reaches them and this one cannot write them), 1 the same but writable here, 2 shared with other tasks, 3
+/// unknown. vm_region_submap_short_info_64 (osfmk/mach/vm_region.h, under #pragma pack(4)): 48 bytes, 12 words.
+#[cfg(target_vendor = "apple")]
+fn dirty_sharing(address: u64) -> usize {
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct ShortInfo {
+        protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+        offset: u64,
+        user_tag: u32,
+        ref_count: u32,
+        shadow_depth: u16,
+        external_pager: u8,
+        share_mode: u8,
+        is_submap: i32,
+        behavior: i32,
+        object_id: u32,
+        user_wired_count: u16,
+        flags: u16,
+    }
+    const _: () = assert!(std::mem::size_of::<ShortInfo>() == 48);
+    unsafe extern "C" {
+        fn mach_vm_region_recurse(task: u32, address: *mut u64, size: *mut u64, depth: *mut u32, info: *mut i32, count: *mut u32) -> i32;
+    }
+    let mut depth = 0u32;
+    for _ in 0..4 {
+        let (mut at, mut size, mut count) = (address, 0u64, 12u32);
+        let mut info = ShortInfo::default();
+        // SAFETY: the out pointers are this frame's, info holds `count` words.
+        let kr = unsafe {
+            mach_vm_region_recurse(libc::mach_task_self(), &mut at, &mut size, &mut depth, (&mut info as *mut ShortInfo).cast(), &mut count)
+        };
+        if kr != 0 || at > address {
+            return 3;
+        }
+        if { info.is_submap } != 0 {
+            depth += 1;
+            continue;
+        }
+        let writable = { info.protection } & 2 != 0;   // VM_PROT_WRITE
+        return match { info.share_mode } {
+            1 | 2 | 3 | 6 => usize::from(writable),   // SM_COW, SM_PRIVATE, SM_EMPTY, SM_PRIVATE_ALIASED
+            4 | 5 | 7 => 2,                           // SM_SHARED, SM_TRUESHARED, SM_SHARED_ALIASED
+            _ => 3,
+        };
+    }
+    3
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn dirty_sharing(_address: u64) -> usize {
+    3
+}
+
+/// The hashing thread: a round once a commit asked a stamp, at most four a second, over the watched pages of the memories asked of.
+fn dirty_rounds() {
+    #[cfg(target_vendor = "apple")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
+        }
+        // SAFETY: this thread's own class: QOS_CLASS_UTILITY, below the render server's threads.
+        unsafe { pthread_set_qos_class_self_np(0x11, 0) };
+    }
+    // SAFETY: no arguments.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok().filter(|&p| p >= 4096).unwrap_or(16384);
+    let mut seen: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut last: Option<std::time::Instant> = None;
+    loop {
+        let shared = dirty_shared();
+        {
+            let mut wake = dirty_lock(&shared.wake);
+            while !*wake {
+                wake = shared.woken.wait(wake).unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            *wake = false;
+        }
+        if let Some(rest) = last.and_then(|last| std::time::Duration::from_millis(250).checked_sub(last.elapsed())) {
+            std::thread::sleep(rest);
+        }
+        let began = std::time::Instant::now();
+        last = Some(began);
+        let asked = std::mem::take(&mut *dirty_lock(&shared.asked));
+        let entries: Vec<_> = dirty_lock(&shared.watches).values().filter(|entry| asked.contains_key(&entry.memory)).cloned().collect();
+        // This round's answer per page: None first seen, Some(changed).
+        let mut round: std::collections::HashMap<u64, Option<bool>> = std::collections::HashMap::new();
+        for entry in entries {
+            let alive = dirty_lock(&entry.alive);
+            if !*alive {
+                continue;
+            }
+            let weight = asked[&entry.memory];
+            let mut at = entry.start & !(page - 1);
+            while at < entry.end {
+                let bytes = (at + page).min(entry.end) - at.max(entry.start);
+                let state = *round.entry(at).or_insert_with(|| {
+                    // SAFETY: a whole page of the watched memory, mapped while its watch lives (`alive`); read as words without
+                    // assuming no other task writes them.
+                    let words = at as *const u64;
+                    let mut hash = 0x9e37_79b9_7f4a_7c15u64;
+                    for i in 0..(page / 8) as usize {
+                        let word = unsafe { std::ptr::read_volatile(words.add(i)) };
+                        hash = (hash ^ word).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+                    }
+                    dirty_count(DC_PAGES, 1);
+                    let before = seen.insert(at, hash);
+                    let state = before.map(|before| before != hash);
+                    dirty_count(match state { None => DC_FIRST, Some(true) => DC_CHANGED, Some(false) => DC_SAME }, 1);
+                    state
+                });
+                dirty_count(DC_WEIGHTED, bytes * weight);
+                if state == Some(false) {
+                    dirty_count(DC_WEIGHTED_SAME, bytes * weight);
+                }
+                at += page;
+            }
+            drop(alive);
+        }
+        if seen.len() > 1 << 22 {
+            seen.clear();
+        }
+        DIRTY_COUNTS[DC_KEPT].store(seen.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        dirty_count(DC_ROUNDS, 1);
+        dirty_count(DC_ROUND_US, began.elapsed().as_micros() as u64);
+    }
+}
+
+/// T78: the runtime's counts of the copies a dirty-page log decides, then the measurement's (DIRTY_COUNTS), into the caller's 28
+/// words: copies in gated, of them whole and skipped, their bytes whole and copied, stamps asked, waits, unanswered, wait microseconds.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's 28 words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 28) };
+        let w = get(device)?.0.work_counts();
+        out[..9].copy_from_slice(&[w.dirty_copies_in_gated, w.dirty_copies_in_whole, w.dirty_copies_in_skipped, w.dirty_copy_in_bytes_whole,
+                                   w.dirty_copy_in_bytes_copied, w.dirty_stamps_asked, w.dirty_waits, w.dirty_waits_unanswered,
+                                   w.dirty_wait_nanos / 1000]);
+        for (word, count) in out[9..].iter_mut().zip(&DIRTY_COUNTS) {
+            *word = count.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(true)
+    })
+}
+
 unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64, deallocator: Option<Deallocator>)
                   -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
@@ -874,6 +1158,8 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
         let base = NonNull::new(pointer as *mut u8).ok_or("null memory")?;
         // SAFETY: the caller's contract.
         let memory = unsafe { HostMemory::new(base) };
+        // T78: measured, never answered (DirtyMeasure); off unless TU_DW_TRACE has h, since a log changes how copies in are recorded.
+        let memory = if dirty_measuring() { memory.with_dirty_pages(std::sync::Arc::new(DirtyMeasure::new(pointer as u64))) } else { memory };
         let modes = options(options_word)?;
         // The runtime's live-import lookup and subsequent join are separate:
         // simultaneous first constructors can allocate distinct imports of the
