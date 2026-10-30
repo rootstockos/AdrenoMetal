@@ -329,6 +329,34 @@ pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut 
     })
 }
 
+/// Why textures over host pages were shadowed and what their copies in moved (T77: shadow copies were most of the GPU's time in T76),
+/// into the caller's 24 words: shadowed for the device's policy, a render target, a shader write, a pending check, a failed check, no
+/// checked image, shared rows, detached bytes, no linear image, the pitch, the placement; the in-place checks run, passed, failed,
+/// unchecked and recalled; the texels copied in, of them first copies in from surfaces, large surfaces and host pages, copied in again,
+/// recopied after changes and beyond what was held; textures in place.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_shadow_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's 24 words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 24) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.host_texture_shadows_exact, w.host_texture_shadows_render_target, w.host_texture_shadows_shader_write,
+                              w.host_texture_shadows_check_pending, w.host_texture_shadows_check_failed,
+                              w.host_texture_shadows_unchecked, w.host_texture_shadows_refused_rows,
+                              w.host_texture_shadows_refused_detached, w.host_texture_shadows_refused_image,
+                              w.host_texture_shadows_refused_pitch, w.host_texture_shadows_refused_placement, w.in_place_checks_run,
+                              w.in_place_checks_passed, w.in_place_checks_failed, w.in_place_checks_unchecked,
+                              w.in_place_checks_recalled, w.shadow_texels_copied_in, w.shadow_texels_first_copied_in_surfaces,
+                              w.shadow_texels_first_copied_in_large_surfaces, w.shadow_texels_first_copied_in_host_pages,
+                              w.shadow_texels_first_copied_in_again, w.shadow_texels_recopied_after_changes,
+                              w.shadow_texels_recopied_beyond_held, w.host_textures_in_place]);
+        Ok(true)
+    })
+}
+
 /// Where render passes cost the GPU more than Metal's single pass in tile memory, into the caller's ten words: passes begun as
 /// instances, passes split inline, then instance splits for a barrier, tile memory, a memoryless write and a pending pipeline, stand-ins
 /// made and their bytes, and stand-in copies made and those made at draws.

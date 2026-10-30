@@ -4241,6 +4241,20 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(nmb_device_texture_counts(gDevice,tc))
    row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
     (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
+  // T77: why host-page textures were shadowed (policy, render target, shader write, check pending/failed, unchecked, shared rows,
+  // detached, no image, pitch, placement), the in-place checks (run/passed/failed/unchecked/recalled), and the texels their copies in
+  // moved (MTexels: all; first copies from surfaces, large surfaces, host pages; again; recopied after changes, beyond what was held).
+  uint64_t sc[24]={};
+  if(nmb_device_shadow_counts(gDevice,sc)) {
+   row("SR pol %llu rt %llu sw %llu pend %llu fail %llu unch %llu rows %llu det %llu img %llu pitch %llu place %llu | in %llu",
+    (unsigned long long)sc[0],(unsigned long long)sc[1],(unsigned long long)sc[2],(unsigned long long)sc[3],(unsigned long long)sc[4],
+    (unsigned long long)sc[5],(unsigned long long)sc[6],(unsigned long long)sc[7],(unsigned long long)sc[8],(unsigned long long)sc[9],
+    (unsigned long long)sc[10],(unsigned long long)sc[23]);
+   row("SC checks %llu/%llu/%llu/%llu/%llu | MTx in %llu surf %llu large %llu host %llu again %llu changed %llu beyond %llu",
+    (unsigned long long)sc[11],(unsigned long long)sc[12],(unsigned long long)sc[13],(unsigned long long)sc[14],(unsigned long long)sc[15],
+    (unsigned long long)(sc[16]>>20),(unsigned long long)(sc[17]>>20),(unsigned long long)(sc[18]>>20),(unsigned long long)(sc[19]>>20),
+    (unsigned long long)(sc[20]>>20),(unsigned long long)(sc[21]>>20),(unsigned long long)(sc[22]>>20));
+  }
   // Where passes cost more than one pass in tile memory: passes begun as instances, split inline; instance splits for a barrier, tile
   // memory, a memoryless write, a pending pipeline; stand-ins made and MiB; stand-in copies, of them at draws.
   uint64_t pc[10]={};

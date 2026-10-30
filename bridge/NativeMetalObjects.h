@@ -45,6 +45,9 @@ bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
 bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
+// Why host-page textures were shadowed (11 reasons), the in-place checks (run, passed, failed, unchecked, recalled), the texels copied in and
+// their kinds (6), textures in place.
+bool nmb_device_shadow_counts(const NmbDevice *, uint64_t out[24]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
