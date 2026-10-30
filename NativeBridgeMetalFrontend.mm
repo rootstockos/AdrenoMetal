@@ -40,6 +40,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
 
@@ -213,10 +214,11 @@ static void traceNote(uint32_t tid) {
 // every few seconds: L = samples whose leaf is that symbol, I = samples with that symbol anywhere in the chain.
 static std::atomic<mach_port_t> gSampleThread{0};
 static std::atomic<uint64_t> gSampleTop{0};
-struct StackSample {uint64_t frames[8];};
+struct StackSample {uint64_t frames[16];};
 static StackSample gSamples[8192];
 static std::atomic<uint32_t> gSampleHead{0};
 static std::atomic<bool> gSamplerStarted{false};
+static void startSampler();
 static void sampleWindowOpen() {
 #ifndef NB_SAMPLER
  return;   // the sampler suspends the render thread 2000 times a second: off unless asked for
@@ -225,6 +227,23 @@ static void sampleWindowOpen() {
  if(strncmp(name,"com.apple.coreanimation",23))return;
  gSampleTop.store((uint64_t)pthread_get_stackaddr_np(pthread_self()));
  gSampleThread.store(pthread_mach_thread_np(pthread_self()));
+ startSampler();
+}
+// The encode thread sampled for its whole life (kernel boot argument asteroids-sample=1): where the render server's Vulkan recording and
+// submission spend the 8 ms after each heavy commit (T75), idle waits included, so the profile shows both the work and the waiting.
+static bool sampleEncodeThreadAsked() {
+ char args[1024]={};size_t size=sizeof args - 1;
+ if(sysctlbyname("kern.bootargs",args,&size,nullptr,0)!=0)return false;
+ for(const char *at=strstr(args,"asteroids-sample=");at;at=strstr(at+1,"asteroids-sample="))
+  if((at==args || at[-1]==' ') && at[17]=='1')return true;
+ return false;
+}
+static void sampleThisThread() {
+ gSampleTop.store((uint64_t)pthread_get_stackaddr_np(pthread_self()));
+ gSampleThread.store(pthread_mach_thread_np(pthread_self()));
+ startSampler();
+}
+static void startSampler() {
  if(!gSamplerStarted.exchange(true))std::thread([]{
   pthread_setname_np("frame-sampler");
   for(;;) {
@@ -241,7 +260,7 @@ static void sampleWindowOpen() {
     sample.frames[n++]=arm_thread_state64_get_pc(state)&mask;
     sample.frames[n++]=arm_thread_state64_get_lr(state)&mask;
     uint64_t fp=arm_thread_state64_get_fp(state)&mask;
-    while(n<8 && fp>=sp && fp+16<=top && !(fp&15)) {
+    while(n<16 && fp>=sp && fp+16<=top && !(fp&15)) {
      const uint64_t *record=(const uint64_t *)fp;
      sample.frames[n++]=record[1]&mask;
      const uint64_t next=record[0]&mask;
@@ -281,9 +300,9 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
   const StackSample &sample=gSamples[consumed%8192];++consumed;++total;
   leaf[resolve(sample.frames[0])]++;
   addresses[sample.frames[0]].leaf++;
-  for(unsigned i=0;i<8 && sample.frames[i];i++){bool dup=false;for(unsigned j=0;j<i;j++)if(sample.frames[j]==sample.frames[i])dup=true;if(!dup)addresses[sample.frames[i]].inclusive++;}
-  std::string seen[8];unsigned count=0;
-  for(unsigned i=0;i<8 && sample.frames[i];i++) {
+  for(unsigned i=0;i<16 && sample.frames[i];i++){bool dup=false;for(unsigned j=0;j<i;j++)if(sample.frames[j]==sample.frames[i])dup=true;if(!dup)addresses[sample.frames[i]].inclusive++;}
+  std::string seen[16];unsigned count=0;
+  for(unsigned i=0;i<16 && sample.frames[i];i++) {
    std::string name=resolve(sample.frames[i]);
    const size_t plus=name.rfind('+');if(plus!=std::string::npos && i>0)name.resize(plus);
    bool dup=false;for(unsigned j=0;j<count;j++)if(seen[j]==name)dup=true;
@@ -327,7 +346,12 @@ static void traceStartWriter() {
   snprintf(root,sizeof root,"/private/var/root/Library/Caches/com.apple.backboardd/m2v/gpu/frames-%d.trace",getpid());
   const char *const paths[]={mobile,root};
   uint32_t written=0,sampled=0;int profileFd=-1;
-  static const char *const profilePaths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/cpu.profile","/private/var/root/Library/Caches/com.apple.backboardd/m2v/cpu.profile"};
+  char mobileProfile[128],rootProfile[128];
+  snprintf(mobileProfile,sizeof mobileProfile,"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/gpu/cpu-%d.profile",getpid());
+  snprintf(rootProfile,sizeof rootProfile,"/private/var/root/Library/Caches/com.apple.backboardd/m2v/gpu/cpu-%d.profile",getpid());
+  const char *const profilePaths[]={mobileProfile,rootProfile};
+  mkdir("/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/gpu",0755);
+  mkdir("/private/var/root/Library/Caches/com.apple.backboardd/m2v/gpu",0755);
   for(;;) {
    usleep(400000);
    sampleWriteProfile(sampled,profileFd,profilePaths);
@@ -1729,6 +1753,7 @@ static EncodeThread &encodeThread() {
   pthread_create(&id,&attr,[](void *arg)->void * {
    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
    pthread_setname_np("native-metal-encode");
+   if(sampleEncodeThreadAsked())sampleThisThread();
    std::unique_lock<std::mutex> lock(t.lock);
    for(;;) {
     t.work.wait(lock,[&]{return !t.batches.empty();});
