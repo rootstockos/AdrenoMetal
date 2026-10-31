@@ -610,10 +610,21 @@ pub extern "C" fn nmb_device_family_waivers(device: *const NmbDevice, out: *mut 
     })
 }
 
+/// The alignment this device answers for a linear texture's offset and rows in a buffer, where the runtime answers Metal's 16 (and
+/// takes 16): Turnip's linear images on the A810 start and step their rows at 64 bytes, so a texture placed at 16 is one the runtime
+/// cannot bind in place, and it shadows it and copies every byte in before each use (T76-T78: every shadow was for its pitch or its
+/// placement, a third of the GPU's time in the open/close animations). QuartzCore lays out its textures over buffers by the device's
+/// answer; one placed at 64 binds in place. The IOSurface answers stay the runtime's: no IOSurface texture was shadowed, and the
+/// compositor's surfaces keep their strides.
+const LINEAR_IN_PLACE: u64 = 64;
+
 fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
     let d = &device.0;
     let p = d.properties();
     let none = || format!("the device has no answer for {selector}");
+    if matches!(selector, "deviceLinearTextureAlignmentBytes" | "linearTextureAlignmentBytes" | "deviceLinearReadOnlyTextureAlignmentBytes") {
+        return Ok(LINEAR_IN_PLACE);
+    }
     if let Some(c) = PrivateCount::ALL.into_iter().find(|c| c.selector() == selector) {
         return device.private().count(c).value().ok_or_else(none);
     }
@@ -634,9 +645,6 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         // The runtime binds a buffer at any offset within it (render.rs, setVertexBuffer); 4 is a scalar's alignment, which the shader's
         // own loads need.
         "minConstantBufferAlignmentBytes" => 4,
-        "deviceLinearReadOnlyTextureAlignmentBytes" => {
-            device.private().count(PrivateCount::DeviceLinearTextureAlignmentBytes).value().ok_or_else(none)?
-        }
         "areRasterOrderGroupsSupported" | "supportsRasterOrderGroups" => gap(p.are_raster_order_groups_supported())?,
         "isDepth24Stencil8PixelFormatSupported" => gap(p.is_depth24_stencil8_pixel_format_supported())?,
         "areProgrammableSamplePositionsSupported" => gap(p.are_programmable_sample_positions_supported())?,
@@ -652,9 +660,11 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         }
         "supportsYCBCRFormats12" => format_supported(PixelFormat::YCBCR124202P) as u64,
         "supportsYCBCRPackedFormats12" => format_supported(PixelFormat::YCBCR124202PPACKED) as u64,
+        // The runtime refuses the formats no buffer backs; the others are placed at LINEAR_IN_PLACE.
         "minimumLinearTextureAlignmentForPixelFormat:" => p
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
-            .map_err(e("minimum linear texture alignment"))?,
+            .map_err(e("minimum linear texture alignment"))?
+            .max(LINEAR_IN_PLACE),
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
         "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
         "supportsRasterizationRateMapWithLayerCount:" => gap(p.supports_rasterization_rate_map_with_layer_count(arg))?,

@@ -179,7 +179,10 @@ static CommitRecord gCommitRing[32];
 // 72-byte records: type 1 command buffer {idx, t0 created, t1 committed, t2 scheduled (0: unknown), t3 completion callback, a passes, b draws,
 // c thousands of pixels, d blits, tid creator thread, cpu0/cpu1 its cumulative CPU microseconds at creation and at commit, tid2 committing
 // thread}; type 2 waitUntilCompleted {t0 begin, t1 end, tid, a caller (low 32 bits), cpu0 the thread's CPU time at the start, cpu1 at the end};
-// type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}. Times are nowUs().
+// type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}; type 6 a commit's runtime half on the
+// encoding thread {b the commit's index (type 1's idx), t0 the thread reached it (the encoder calls before it done), t1
+// nmb_command_buffer_commit returned, tid, cpu0/cpu1 the thread's CPU time at t0 and t1}; type 7 a thread waiting for the encoding thread
+// to catch up (encodeDrain) for 50 us or more {t0, t1, tid, a caller (low 32 bits)}, which types 2 and 3 count from after. Times are nowUs().
 struct TraceRec {uint32_t type,idx;uint64_t t0,t1,t2,t3;uint32_t a,b,c,d,tid,cpu0,cpu1,tid2;};
 static_assert(sizeof(TraceRec)==72,"trace record");
 static TraceRec gTrace[16384];
@@ -201,6 +204,11 @@ static void traceStartWriter();
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
  TraceRec rec={};rec.type=5;rec.t0=offered;rec.t1=copied;rec.t2=completed;rec.a=sequence;rec.b=result;tracePush(rec);
  traceStartWriter();
+}
+static void traceDrain(uint64_t began,uint32_t caller) {
+ const uint64_t ended=nowUs();
+ if(ended-began<50)return;
+ TraceRec rec={};rec.type=7;rec.t0=began;rec.t1=ended;rec.tid=threadIdLow();rec.a=caller;tracePush(rec);
 }
 static void traceNote(uint32_t tid) {
  static std::atomic<uint32_t> seen[64];
@@ -1791,9 +1799,13 @@ static void encodeDrain() {
  if(!gEncodeThread || onEncodeQueue())return;
  encodeFlush();
  EncodeThread &t=encodeThread();
- std::unique_lock<std::mutex> lock(t.lock);
- const uint64_t target=t.queued;
- t.idle.wait(lock,[&]{return t.done>=target;});
+ const uint64_t began=nowUs();
+ {
+  std::unique_lock<std::mutex> lock(t.lock);
+  const uint64_t target=t.queued;
+  t.idle.wait(lock,[&]{return t.done>=target;});
+ }
+ traceDrain(began,(uint32_t)(uintptr_t)__builtin_return_address(0));
 }
 #define ENCODE(...) encodeLater([=]{__VA_ARGS__;})
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
@@ -2765,8 +2777,11 @@ static char kUserDictionaryKey;
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
-  if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
+  TraceRec stage={};stage.type=6;stage.b=self.commitIndex;stage.t0=nowUs();stage.cpu0=threadCpuUs();
+  const bool committed=nmb_command_buffer_on_completed(_handle,completed,context) &&
+                       nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle);
+  stage.t1=nowUs();stage.cpu1=threadCpuUs();stage.tid=threadIdLow();traceNote(stage.tid);tracePush(stage);
+  if(committed) {
    const auto range=dumpRange();
    self.submitted=YES;
    if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
@@ -3553,10 +3568,13 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
 }
-// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
-// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
+// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the runtime's
+// IOSurface answer, not the linear one, which is raised for textures over buffers (NativeMetalObjects.rs LINEAR_IN_PLACE) and would move
+// the compositor's surface strides.
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
+ uint64_t value=0;
+ if(!nmb_device_answer(gDevice,"iosurfaceReadOnlyTextureAlignmentBytes",0,&value) || !value)value=16;
+ return (NSUInteger)value;
 }
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
