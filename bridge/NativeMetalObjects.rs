@@ -874,10 +874,11 @@ pub extern "C" fn nmb_no_copy_remaps(out: *mut u64) -> bool {
 // since its last round, weighted by those stamps: a lower bound on what a log would let the copies skip (a page that changed once in a
 // round's 250 ms counts as changed for every copy in it). Each watch also notes how its pages are shared (mach_vm_region_recurse).
 
-/// The measurement's counters, nmb_device_dirty_counts' last 19 words: sources, watches made and live, watched bytes made, and of
+/// The measurement's counters, nmb_device_dirty_counts' last 20 words: sources, watches made and live, watched bytes made, and of
 /// them private or copy-on-write read-only, private or copy-on-write writable, shared, unknown; stamps asked, writes reported, rounds,
-/// their microseconds, pages hashed, unchanged, changed and first seen, watched bytes weighted by stamps, of them unchanged; pages kept.
-static DIRTY_COUNTS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
+/// their microseconds, pages hashed, unchanged, changed and first seen, watched bytes weighted by stamps, of them unchanged; pages kept;
+/// pages no longer mapped when a round read them.
+static DIRTY_COUNTS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
 const DC_SOURCES: usize = 0;
 const DC_WATCHES: usize = 1;
 const DC_WATCHES_LIVE: usize = 2;
@@ -894,6 +895,7 @@ const DC_FIRST: usize = 15;
 const DC_WEIGHTED: usize = 16;
 const DC_WEIGHTED_SAME: usize = 17;
 const DC_KEPT: usize = 18;
+const DC_GONE: usize = 19;
 
 fn dirty_count(i: usize, n: u64) {
     DIRTY_COUNTS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -905,7 +907,9 @@ fn dirty_measuring() -> bool {
 }
 
 /// A watched range's bytes (host addresses), alive until its watch drops; the hashing thread reads them only while it holds `alive`
-/// and finds it true, and the drop clears it under the same lock, so no round reads pages the memory may have freed.
+/// and finds it true, and the drop clears it under the same lock. The watch does not keep the pages: the memory (shared with other
+/// tasks) can be unmapped while metal2vulkan still holds its log, so a round copies each page out with a read that fails on an unmapped
+/// page (dirty_page_hash) rather than loading it (T78h: the loads faulted and ended the render server).
 struct DirtyEntry {
     memory: u64,
     start: u64,
@@ -1056,6 +1060,28 @@ fn dirty_sharing(_address: u64) -> usize {
     3
 }
 
+/// The hash of the page at `at`, copied into `words` (one page) by mach_vm_read_overwrite, which answers KERN_INVALID_ADDRESS for a page
+/// no longer mapped where a load would fault; None then.
+#[cfg(target_vendor = "apple")]
+fn dirty_page_hash(at: u64, words: &mut [u64]) -> Option<u64> {
+    unsafe extern "C" {
+        fn mach_vm_read_overwrite(task: u32, address: u64, size: u64, data: u64, out_size: *mut u64) -> i32;
+    }
+    let size = (words.len() * 8) as u64;
+    let mut read = 0u64;
+    // SAFETY: `words` is this thread's buffer of `size` bytes; the kernel copies into it or fails.
+    let kr = unsafe { mach_vm_read_overwrite(libc::mach_task_self(), at, size, words.as_mut_ptr() as u64, &mut read) };
+    if kr != 0 || read != size {
+        return None;
+    }
+    Some(words.iter().fold(0x9e37_79b9_7f4a_7c15u64, |hash, &word| (hash ^ word).wrapping_mul(0x0100_0000_01b3).rotate_left(29)))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn dirty_page_hash(_at: u64, _words: &mut [u64]) -> Option<u64> {
+    None
+}
+
 /// The hashing thread: a round once a commit asked a stamp, at most four a second, over the watched pages of the memories asked of.
 fn dirty_rounds() {
     #[cfg(target_vendor = "apple")]
@@ -1069,6 +1095,7 @@ fn dirty_rounds() {
     // SAFETY: no arguments.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok().filter(|&p| p >= 4096).unwrap_or(16384);
     let mut seen: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut words = vec![0u64; (page / 8) as usize];
     let mut last: Option<std::time::Instant> = None;
     loop {
         let shared = dirty_shared();
@@ -1086,8 +1113,8 @@ fn dirty_rounds() {
         last = Some(began);
         let asked = std::mem::take(&mut *dirty_lock(&shared.asked));
         let entries: Vec<_> = dirty_lock(&shared.watches).values().filter(|entry| asked.contains_key(&entry.memory)).cloned().collect();
-        // This round's answer per page: None first seen, Some(changed).
-        let mut round: std::collections::HashMap<u64, Option<bool>> = std::collections::HashMap::new();
+        // This round's answer per page: None gone, Some(None) first seen, Some(Some(changed)).
+        let mut round: std::collections::HashMap<u64, Option<Option<bool>>> = std::collections::HashMap::new();
         for entry in entries {
             let alive = dirty_lock(&entry.alive);
             if !*alive {
@@ -1097,21 +1124,22 @@ fn dirty_rounds() {
             let mut at = entry.start & !(page - 1);
             while at < entry.end {
                 let bytes = (at + page).min(entry.end) - at.max(entry.start);
+                // None: the page is gone (counted once a round, left out of the weights).
                 let state = *round.entry(at).or_insert_with(|| {
-                    // SAFETY: a whole page of the watched memory, mapped while its watch lives (`alive`); read as words without
-                    // assuming no other task writes them.
-                    let words = at as *const u64;
-                    let mut hash = 0x9e37_79b9_7f4a_7c15u64;
-                    for i in 0..(page / 8) as usize {
-                        let word = unsafe { std::ptr::read_volatile(words.add(i)) };
-                        hash = (hash ^ word).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
-                    }
+                    let Some(hash) = dirty_page_hash(at, &mut words) else {
+                        dirty_count(DC_GONE, 1);
+                        return None;
+                    };
                     dirty_count(DC_PAGES, 1);
                     let before = seen.insert(at, hash);
                     let state = before.map(|before| before != hash);
                     dirty_count(match state { None => DC_FIRST, Some(true) => DC_CHANGED, Some(false) => DC_SAME }, 1);
-                    state
+                    Some(state)
                 });
+                let Some(state) = state else {
+                    at += page;
+                    continue;
+                };
                 dirty_count(DC_WEIGHTED, bytes * weight);
                 if state == Some(false) {
                     dirty_count(DC_WEIGHTED_SAME, bytes * weight);
@@ -1129,7 +1157,7 @@ fn dirty_rounds() {
     }
 }
 
-/// T78: the runtime's counts of the copies a dirty-page log decides, then the measurement's (DIRTY_COUNTS), into the caller's 28
+/// T78: the runtime's counts of the copies a dirty-page log decides, then the measurement's (DIRTY_COUNTS), into the caller's 29
 /// words: copies in gated, of them whole and skipped, their bytes whole and copied, stamps asked, waits, unanswered, wait microseconds.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u64) -> bool {
@@ -1137,8 +1165,8 @@ pub extern "C" fn nmb_device_dirty_counts(device: *const NmbDevice, out: *mut u6
         if out.is_null() {
             return Err("null counts".into());
         }
-        // SAFETY: the header's 28 words.
-        let out = unsafe { std::slice::from_raw_parts_mut(out, 28) };
+        // SAFETY: the header's 29 words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 29) };
         let w = get(device)?.0.work_counts();
         out[..9].copy_from_slice(&[w.dirty_copies_in_gated, w.dirty_copies_in_whole, w.dirty_copies_in_skipped, w.dirty_copy_in_bytes_whole,
                                    w.dirty_copy_in_bytes_copied, w.dirty_stamps_asked, w.dirty_waits, w.dirty_waits_unanswered,

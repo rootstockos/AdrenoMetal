@@ -49,8 +49,8 @@ bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
 // their kinds (6), textures in place.
 bool nmb_device_shadow_counts(const NmbDevice *, uint64_t out[24]);
 // T78 (TU_DW_TRACE with h): the copies in a dirty-page log would decide (gated, whole, skipped, bytes whole and copied, stamps, waits,
-// unanswered, wait us), then the bridge's measurement of them (19 words, NativeMetalObjects.rs DIRTY_COUNTS).
-bool nmb_device_dirty_counts(const NmbDevice *, uint64_t out[28]);
+// unanswered, wait us), then the bridge's measurement of them (20 words, NativeMetalObjects.rs DIRTY_COUNTS).
+bool nmb_device_dirty_counts(const NmbDevice *, uint64_t out[29]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
